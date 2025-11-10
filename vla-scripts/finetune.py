@@ -64,6 +64,9 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import sys
+print("DEBUG argv from finetune.py:", sys.argv, flush=True)
+
 
 @dataclass
 class FinetuneConfig:

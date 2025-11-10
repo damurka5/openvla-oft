@@ -228,3 +228,11 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
     ],
 # fmt: on
 }
+
+# OXE_NAMED_MIXTURES["cdpr_local"] = {
+#     "datasets": [
+#         {"name": "cdpr_local", "weight": 1.0}
+#     ]
+# }
+# OXE_NAMED_MIXTURES["cdpr_local"] = [("cdpr_local", 1.0)]
+

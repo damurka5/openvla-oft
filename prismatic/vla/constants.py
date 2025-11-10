@@ -5,6 +5,7 @@ Attempts to automatically identify the correct constants to set based on the Pyt
 training or evaluation. If it is unclear, defaults to using the LIBERO simulation benchmark constants.
 """
 import sys
+import os
 from enum import Enum
 
 # Llama 2 token constants
@@ -44,40 +45,92 @@ BRIDGE_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+CDPR_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 8,          # keep your chunking
+    "ACTION_DIM": 5,                 # [x,y,z,yaw,grip]
+    "PROPRIO_DIM": 5,                # same 5-D proprio you export
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+}
 
-# Function to detect robot platform from command line arguments
+
+# # Function to detect robot platform from command line arguments
+# def detect_robot_platform():
+#     cmd_args = " ".join(sys.argv).lower()
+
+#     if "libero" in cmd_args:
+#         return "LIBERO"
+#     elif "aloha" in cmd_args:
+#         return "ALOHA"
+#     elif "bridge" in cmd_args:
+#         return "BRIDGE"
+#     elif "cdpr" in cmd_args:
+#         return "CDPR"
+#     else:
+#         # Default to LIBERO if unclear
+#         return "LIBERO"
+
+
+# # Determine which robot platform to use
+# ROBOT_PLATFORM = detect_robot_platform()
+
+# # Set the appropriate constants based on the detected platform
+# if ROBOT_PLATFORM == "LIBERO":
+#     constants = LIBERO_CONSTANTS
+# elif ROBOT_PLATFORM == "ALOHA":
+#     constants = ALOHA_CONSTANTS
+# elif ROBOT_PLATFORM == "BRIDGE":
+#     constants = BRIDGE_CONSTANTS
+# elif ROBOT_PLATFORM == "CDPR":
+#     constants = CDPR_CONSTANTS
+
+# # Assign constants to global variables
+# NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
+# ACTION_DIM = constants["ACTION_DIM"]
+# PROPRIO_DIM = constants["PROPRIO_DIM"]
+# ACTION_PROPRIO_NORMALIZATION_TYPE = constants["ACTION_PROPRIO_NORMALIZATION_TYPE"]
+
+# # Print which robot platform constants are being used (for debugging)
+# print(f"Using {ROBOT_PLATFORM} constants:")
+# print(f"  NUM_ACTIONS_CHUNK = {NUM_ACTIONS_CHUNK}")
+# print(f"  ACTION_DIM = {ACTION_DIM}")
+# print(f"  PROPRIO_DIM = {PROPRIO_DIM}")
+# print(f"  ACTION_PROPRIO_NORMALIZATION_TYPE = {ACTION_PROPRIO_NORMALIZATION_TYPE}")
+# print("If needed, manually set the correct constants in `prismatic/vla/constants.py`!")
 def detect_robot_platform():
-    cmd_args = " ".join(sys.argv).lower()
+    # 1) Highest priority: explicit env variable
+    env = os.environ.get("VLA_ROBOT", "").strip().lower()
+    if env in {"cdpr", "libero", "aloha", "bridge"}:
+        return env.upper()
 
+    # 2) Fallback: argv sniffing (case-insensitive)
+    cmd_args = " ".join(sys.argv).lower()
+    # prefer the more specific match first
+    if "cdpr" in cmd_args:
+        return "CDPR"
+    if "aloha" in cmd_args:
+        return "ALOHA"
+    if "bridge" in cmd_args:
+        return "BRIDGE"
     if "libero" in cmd_args:
         return "LIBERO"
-    elif "aloha" in cmd_args:
-        return "ALOHA"
-    elif "bridge" in cmd_args:
-        return "BRIDGE"
-    else:
-        # Default to LIBERO if unclear
-        return "LIBERO"
+    return "LIBERO"  # default
 
-
-# Determine which robot platform to use
 ROBOT_PLATFORM = detect_robot_platform()
 
-# Set the appropriate constants based on the detected platform
-if ROBOT_PLATFORM == "LIBERO":
-    constants = LIBERO_CONSTANTS
+if ROBOT_PLATFORM == "CDPR":
+    constants = CDPR_CONSTANTS
 elif ROBOT_PLATFORM == "ALOHA":
     constants = ALOHA_CONSTANTS
 elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
+else:
+    constants = LIBERO_CONSTANTS
 
-# Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
 ACTION_DIM = constants["ACTION_DIM"]
 PROPRIO_DIM = constants["PROPRIO_DIM"]
 ACTION_PROPRIO_NORMALIZATION_TYPE = constants["ACTION_PROPRIO_NORMALIZATION_TYPE"]
 
-# Print which robot platform constants are being used (for debugging)
 print(f"Using {ROBOT_PLATFORM} constants:")
 print(f"  NUM_ACTIONS_CHUNK = {NUM_ACTIONS_CHUNK}")
 print(f"  ACTION_DIM = {ACTION_DIM}")

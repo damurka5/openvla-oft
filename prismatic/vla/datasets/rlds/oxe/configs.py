@@ -26,6 +26,7 @@ Configuration adopts the following structure:
 
 from enum import IntEnum
 
+
 from prismatic.vla.datasets.rlds.oxe.utils.droid_utils import zero_action_filter
 
 
@@ -707,3 +708,30 @@ OXE_DATASET_CONFIGS = {
         "action_encoding": ActionEncoding.JOINT_POS_BIMANUAL,
     },
 }
+
+# --- CDPR local (absolute TFRecord paths) -------------------------------------
+OXE_DATASET_CONFIGS["cdpr_local"] = {
+    "name": "cdpr_local",
+    "tfrecord_globs": [
+        "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/libero_spatial_no_noops/tfrecords/libero_spatial_no_noops-train-*.tfrecord",
+    ],
+    "image_obs_keys": {"primary": "observation/primary", "wrist": "observation/wrist"},
+    "depth_obs_keys": {},
+    "state_obs_keys": "observation/state",
+    "language_key": "observation/task_description",
+    "action_key": "action",
+    "action_encoding": "EEF_POS",   # see next section about 5-DoF
+    "aux_kwargs": {
+        "action_stats": "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/action_stats_libero_spatial_no_noops.json"
+    },
+}
+
+
+
+
+
+
+
+
+
+
