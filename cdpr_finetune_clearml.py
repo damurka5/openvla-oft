@@ -7,25 +7,40 @@ PROJECT = "CDPR"
 TASK_NAME = "openvla-7b-oft-cdpr"
 
 
-def find_tfrecord_dir(root: str) -> str:
+def find_tfrecord_dir(dataset_root: str) -> str:
     """
-    Recursively search for a directory literally named 'tfrecords'
-    somewhere under `root` and return its full path.
+    Walk the ClearML dataset directory and find a folder that contains .tfrecord files.
+    Prefer one that has 'libero_spatial_no_noops' in its path, if available.
     """
-    print(f"[CDPR] Scanning dataset root for 'tfrecords' dirs: {root}", flush=True)
-    for cur_root, dirs, files in os.walk(root):
-        # quick log so you see some structure in ClearML logs
-        rel = os.path.relpath(cur_root, root)
+    print(f"[CDPR] Scanning dataset root for .tfrecord files: {dataset_root}", flush=True)
+    candidates = []
+
+    for cur_root, dirs, files in os.walk(dataset_root):
+        rel = os.path.relpath(cur_root, dataset_root)
         print(f"[CDPR]   inspecting: {rel}", flush=True)
 
-        if os.path.basename(cur_root) == "tfrecords":
-            print(f"[CDPR] Found 'tfrecords' directory at: {cur_root}", flush=True)
-            return cur_root
+        if any(f.endswith(".tfrecord") for f in files):
+            print(f"[CDPR]     found .tfrecord files in: {cur_root}", flush=True)
+            candidates.append(cur_root)
 
-    raise FileNotFoundError(
-        f"[CDPR] Could not find any directory named 'tfrecords' under {root}. "
-        f"Check what you added to the ClearML dataset."
-    )
+    if not candidates:
+        # Extra debug: show what’s actually in the root
+        print("[CDPR] No .tfrecord files found. Root dir contents:", flush=True)
+        print(os.listdir(dataset_root), flush=True)
+        raise FileNotFoundError(
+            f"[CDPR] No .tfrecord files found under dataset root: {dataset_root}. "
+            f"Check what you added to the ClearML dataset."
+        )
+
+    # Prefer a directory whose path looks like your original
+    for c in candidates:
+        if "libero_spatial_no_noops" in c:
+            print(f"[CDPR] Selected TFRecord directory (preferred match): {c}", flush=True)
+            return c
+
+    # Fallback: first candidate
+    print(f"[CDPR] Selected TFRecord directory (first found): {candidates[0]}", flush=True)
+    return candidates[0]
 
 
 def main():
@@ -38,7 +53,7 @@ def main():
 
     print(f"[CDPR] ClearML dataset root: {data_root}", flush=True)
 
-    # 3) Auto-detect where the 'tfrecords' dir actually lives inside the dataset
+    # 3) Auto-detect where TFRecords actually live inside the dataset
     tfrecord_src = find_tfrecord_dir(data_root)
 
     # The path that your finetune config still expects
@@ -52,12 +67,15 @@ def main():
 
     os.makedirs(os.path.dirname(tfrecord_dest), exist_ok=True)
 
-    # If destination exists but isn't already a symlink, you *could* clean it up,
-    # but in this scenario it shouldn't exist at all.
-    if not os.path.exists(tfrecord_dest):
-        os.symlink(tfrecord_src, tfrecord_dest)
-    else:
-        print(f"[CDPR] Destination already exists: {tfrecord_dest}", flush=True)
+    # If dest already exists, clean it up (just in case)
+    if os.path.islink(tfrecord_dest) or os.path.exists(tfrecord_dest):
+        try:
+            os.remove(tfrecord_dest)
+        except IsADirectoryError:
+            import shutil
+            shutil.rmtree(tfrecord_dest)
+
+    os.symlink(tfrecord_src, tfrecord_dest)
 
     # 4) Env vars
     os.environ["VLA_ROBOT"] = "CDPR"
