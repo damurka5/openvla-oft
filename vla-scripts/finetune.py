@@ -77,7 +77,7 @@ class FinetuneConfig:
     data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
     dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
-    shuffle_buffer_size: int = 256 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    shuffle_buffer_size: int = 128 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
