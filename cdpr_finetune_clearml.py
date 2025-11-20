@@ -100,11 +100,11 @@ def main():
         "--use_proprio",
         "True",
         "--batch_size",
-        "2",
+        "1",
         "--learning_rate",
         "1e-4",
         "--max_steps",
-        "3000",
+        "100",
     ]
 
     print("Running command:", " ".join(cmd), flush=True)
