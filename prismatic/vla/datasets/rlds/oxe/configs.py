@@ -715,14 +715,22 @@ OXE_DATASET_CONFIGS["cdpr_local"] = {
     "tfrecord_globs": [
         "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/libero_spatial_no_noops/tfrecords/libero_spatial_no_noops-train-*.tfrecord",
     ],
-    "image_obs_keys": {"primary": "observation/primary", "wrist": "observation/wrist"},
-    "depth_obs_keys": {},
-    "state_obs_keys": "observation/state",
+    "image_obs_keys": {
+        "primary": "observation/primary",
+        "secondary": None,
+        "wrist": "observation/wrist",
+    },
+    "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+
+    "state_obs_keys": ["state"],
+    "state_encoding": StateEncoding.POS_EULER,  # or POS_EULER if FLAT doesn’t exist
+
     "language_key": "observation/task_description",
     "action_key": "action",
-    "action_encoding": "EEF_POS",   # see next section about 5-DoF
+    "action_encoding": ActionEncoding.EEF_POS,
+
     "aux_kwargs": {
-        "action_stats": "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/action_stats_libero_spatial_no_noops.json"
+        "action_stats": "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/action_stats_libero_spatial_no_noops.json",
     },
 }
 
