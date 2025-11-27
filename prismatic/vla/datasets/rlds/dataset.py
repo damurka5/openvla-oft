@@ -834,7 +834,7 @@ def make_interleaved_dataset(
                     print(f"[AFTER TRAJ TRANSFORMS] proprio shape: {obs['proprio'].shape}", flush=True)
             return x
         
-        dataset = dataset.map(debug_after_traj_transforms)
+        # dataset = dataset.map(debug_after_traj_transforms)
         dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
         datasets.append(dataset)
 
