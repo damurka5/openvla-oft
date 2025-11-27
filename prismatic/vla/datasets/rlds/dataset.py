@@ -515,69 +515,117 @@ def apply_per_dataset_frame_transforms(
         dataset = dataset.filter(chunk_filter_fn)
     return dataset
 
+def custom_decode_and_resize(obs, resize_size=None):
+    """Custom decode function that handles your image format"""
+    if resize_size is None:
+        resize_size = {}
+    
+    # Handle different image keys
+    image_keys = ["image_primary", "image_wrist"]
+    
+    for key in image_keys:
+        if key in obs and obs[key] is not None:
+            # Decode the image from bytes
+            image = tf.io.decode_image(obs[key], channels=3, expand_animations=False)
+            
+            # Ensure the image has the right dtype and shape
+            image = tf.cast(image, tf.float32) / 255.0
+            
+            # Resize if specified for this key
+            if key in resize_size:
+                image = tf.image.resize(image, resize_size[key], method="lanczos3", antialias=True)
+            
+            obs[key] = image
+    
+    return obs
 
-def apply_frame_transforms(
-    dataset: dl.DLataset,
-    *,
-    train: bool,                                # kept for API parity; not passed to transforms below
-    image_obs_keys=None,                        # {"primary": "...", "wrist": "..."} or ["primary","wrist"]
-    language_key: str = "language_instruction",
-    image_augment_kwargs: Union[Dict, Dict[str, Dict]] = {},
-    resize_size: Union[Tuple[int, int], Dict[str, Tuple[int, int]]] = {},
-    depth_resize_size: Union[Tuple[int, int], Dict[str, Tuple[int, int]]] = {},
-    num_parallel_calls: int = tf.data.AUTOTUNE,
-) -> dl.DLataset:
-    dataset = _ensure_dldataset(dataset)
-    import tensorflow as tf
-    from functools import partial
-
-    # Standardize image field names
-    if isinstance(image_obs_keys, dict):
-        image_names = [f"image_{k}" for k in image_obs_keys.keys()]
-    elif isinstance(image_obs_keys, (list, tuple)):
-        image_names = [n if n.startswith("image_") else f"image_{n}" for n in image_obs_keys]
+def apply_frame_transforms(dataset, resize_size=(224, 224), num_parallel_calls=None, train=True):
+    """Apply frame-level transforms to the dataset."""
+    
+    # Convert resize_size to dict format if it's a tuple
+    if isinstance(resize_size, tuple):
+        resize_size_dict = {
+            "image_primary": resize_size,
+            "image_wrist": resize_size,
+        }
     else:
-        image_names = ["image_primary", "image_wrist"]
-
-    # 1) Squeeze any rank-1, length-1 strings to scalars BEFORE decoding
-    def _squeeze_singletons(frame):
-        obs = frame["observation"]
-
-        def _maybe_squeeze(x):
-            return tf.cond(tf.equal(tf.rank(x), 1), lambda: x[0], lambda: x)
-
-        for name in image_names:
-            if name in obs:
-                obs[name] = _maybe_squeeze(obs[name])
-
-        if "task" in frame and language_key in frame["task"]:
-            frame["task"][language_key] = _maybe_squeeze(frame["task"][language_key])
-        return frame
-
-    dataset = dataset.frame_map(_squeeze_singletons, num_parallel_calls)
-
-    # 2) Helpers: apply transform to observation ONLY (no vmap!)
-    def apply_obs_only(fn, frame: Dict) -> Dict:
+        resize_size_dict = resize_size
+    
+    def apply_obs_only(frame, fn):
         frame["observation"] = fn(frame["observation"])
         return frame
-
-    # 3) Decode + resize images (no 'train' kwarg)
-    decode_resize = partial(
-        obs_transforms.decode_and_resize,
-        resize_size=resize_size,
-        depth_resize_size=depth_resize_size,
+    
+    # Use your custom decode function
+    decode_fn = lambda obs: custom_decode_and_resize(obs, resize_size_dict)
+    
+    dataset = dataset.frame_map(
+        partial(apply_obs_only, decode_fn), 
+        num_parallel_calls=num_parallel_calls
     )
-    dataset = dataset.frame_map(partial(apply_obs_only, decode_resize), num_parallel_calls)
-
-    # 4) Optional augmentation (no 'train' kwarg)
-    if train and image_augment_kwargs:
-        def aug(frame: dict):
-            seed = tf.random.uniform([2], maxval=tf.dtypes.int32.max, dtype=tf.int32)
-            aug_fn = partial(obs_transforms.augment, seed=seed, augment_kwargs=image_augment_kwargs)
-            return apply_obs_only(aug_fn, frame)
-        dataset = dataset.frame_map(aug, num_parallel_calls)
-
+    
     return dataset
+# def apply_frame_transforms(
+#     dataset: dl.DLataset,
+#     *,
+#     train: bool,                                # kept for API parity; not passed to transforms below
+#     image_obs_keys=None,                        # {"primary": "...", "wrist": "..."} or ["primary","wrist"]
+#     language_key: str = "language_instruction",
+#     image_augment_kwargs: Union[Dict, Dict[str, Dict]] = {},
+#     resize_size: Union[Tuple[int, int], Dict[str, Tuple[int, int]]] = {},
+#     depth_resize_size: Union[Tuple[int, int], Dict[str, Tuple[int, int]]] = {},
+#     num_parallel_calls: int = tf.data.AUTOTUNE,
+# ) -> dl.DLataset:
+#     dataset = _ensure_dldataset(dataset)
+#     import tensorflow as tf
+#     from functools import partial
+
+#     # Standardize image field names
+#     if isinstance(image_obs_keys, dict):
+#         image_names = [f"image_{k}" for k in image_obs_keys.keys()]
+#     elif isinstance(image_obs_keys, (list, tuple)):
+#         image_names = [n if n.startswith("image_") else f"image_{n}" for n in image_obs_keys]
+#     else:
+#         image_names = ["image_primary", "image_wrist"]
+
+#     # 1) Squeeze any rank-1, length-1 strings to scalars BEFORE decoding
+#     def _squeeze_singletons(frame):
+#         obs = frame["observation"]
+
+#         def _maybe_squeeze(x):
+#             return tf.cond(tf.equal(tf.rank(x), 1), lambda: x[0], lambda: x)
+
+#         for name in image_names:
+#             if name in obs:
+#                 obs[name] = _maybe_squeeze(obs[name])
+
+#         if "task" in frame and language_key in frame["task"]:
+#             frame["task"][language_key] = _maybe_squeeze(frame["task"][language_key])
+#         return frame
+
+#     dataset = dataset.frame_map(_squeeze_singletons, num_parallel_calls)
+
+#     # 2) Helpers: apply transform to observation ONLY (no vmap!)
+#     def apply_obs_only(fn, frame: Dict) -> Dict:
+#         frame["observation"] = fn(frame["observation"])
+#         return frame
+
+#     # 3) Decode + resize images (no 'train' kwarg)
+#     decode_resize = partial(
+#         obs_transforms.decode_and_resize,
+#         resize_size=resize_size,
+#         depth_resize_size=depth_resize_size,
+#     )
+#     dataset = dataset.frame_map(partial(apply_obs_only, decode_resize), num_parallel_calls)
+
+#     # 4) Optional augmentation (no 'train' kwarg)
+#     if train and image_augment_kwargs:
+#         def aug(frame: dict):
+#             seed = tf.random.uniform([2], maxval=tf.dtypes.int32.max, dtype=tf.int32)
+#             aug_fn = partial(obs_transforms.augment, seed=seed, augment_kwargs=image_augment_kwargs)
+#             return apply_obs_only(aug_fn, frame)
+#         dataset = dataset.frame_map(aug, num_parallel_calls)
+
+#     return dataset
 
 
 def make_single_dataset(
@@ -1013,7 +1061,6 @@ def make_dataset_from_tfrecord_globs(
 
         for raw in _record_iter():
             step = _parse(raw)
-            # materialize tensors to numpy/bytes here (keeps downstream simple)
             primary = step["observation"]["primary"].numpy()
             wrist   = step["observation"]["wrist"].numpy()
             state   = step["observation"]["state"].numpy()
@@ -1022,32 +1069,19 @@ def make_dataset_from_tfrecord_globs(
             is_first = int(step["is_first"].numpy()[0]) == 1
             is_last  = int(step["is_last"].numpy()[0])  == 1
 
-            if is_first:
-                print(f"[CDPR DEBUG] First step - state shape: {state.shape}, action shape: {act.shape}", flush=True)
-
-            # Validate dimensions
-            if state.shape[0] != PROPRIO_DIM:
-                print(f"[CDPR WARNING] State dimension mismatch: expected {PROPRIO_DIM}, got {state.shape[0]}", flush=True)
-                # Continue or handle as needed
-                
-            if act.shape[0] != ACTION_DIM:
-                print(f"[CDPR WARNING] Action dimension mismatch: expected {ACTION_DIM}, got {act.shape[0]}", flush=True)
-            
             if is_first or not started:
                 if started and len(cur_act):
                     T = len(cur_act)
                     yield {
                         "observation": {
-                            "image_primary": np.asarray(cur_prim, dtype=object),   # bytes
-                            "image_wrist":   np.asarray(cur_wrist, dtype=object),  # bytes
+                            "image_primary": np.asarray(cur_prim, dtype=object),
+                            "image_wrist":   np.asarray(cur_wrist, dtype=object),
                             "proprio":       np.stack(cur_state, axis=0).astype(np.float32),
                             "timestep":      np.arange(T, dtype=np.int32),
                         },
                         "task": {"language_instruction": np.asarray(cur_lang, dtype=object)},
                         "action":       np.stack(cur_act, axis=0).astype(np.float32),
-                        "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
-                        # "dataset_name": dataset_name.encode(),
-
+                        "dataset_name": np.asarray([dataset_name] * T, dtype=object),
                     }
                 cur_prim, cur_wrist, cur_state = [], [], []
                 cur_lang, cur_act = [], []
@@ -1061,10 +1095,6 @@ def make_dataset_from_tfrecord_globs(
 
             if is_last:
                 T = len(cur_act)
-                print("[CDPR EP] T:", T,
-                  "proprio shape:", np.stack(cur_state, axis=0).astype(np.float32).shape,
-                  "action shape:", np.stack(cur_act, axis=0).astype(np.float32).shape,
-                  flush=True)
                 yield {
                     "observation": {
                         "image_primary": np.asarray(cur_prim, dtype=object),
@@ -1074,21 +1104,15 @@ def make_dataset_from_tfrecord_globs(
                     },
                     "task": {"language_instruction": np.asarray(cur_lang, dtype=object)},
                     "action":       np.stack(cur_act, axis=0).astype(np.float32),
-                    "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
-                    # "dataset_name": dataset_name.encode(),
-
+                    "dataset_name": np.asarray([dataset_name] * T, dtype=object),
                 }
                 cur_prim, cur_wrist, cur_state = [], [], []
                 cur_lang, cur_act = [], []
                 started = False
 
-        # flush tail (if no is_last)
+        # Flush any remaining data
         if started and len(cur_act):
             T = len(cur_act)
-            # print("[CDPR EP] T:", T,
-            #       "proprio shape:", ep["observation"]["proprio"].shape,
-            #       "action shape:", ep["action"].shape,
-            #       flush=True)
             yield {
                 "observation": {
                     "image_primary": np.asarray(cur_prim, dtype=object),
@@ -1098,9 +1122,7 @@ def make_dataset_from_tfrecord_globs(
                 },
                 "task": {"language_instruction": np.asarray(cur_lang, dtype=object)},
                 "action":       np.stack(cur_act, axis=0).astype(np.float32),
-                "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
-                # "dataset_name": dataset_name.encode(),
-
+                "dataset_name": np.asarray([dataset_name] * T, dtype=object),
             }
 
     # 3) Build a DLataset directly from the generator (NO tf.data anywhere)
