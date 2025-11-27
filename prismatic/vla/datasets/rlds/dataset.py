@@ -602,6 +602,8 @@ def make_single_dataset(
     dataset = _ensure_dldataset(dataset)
 
     dataset = apply_trajectory_transforms(dataset, **traj_transform_kwargs, train=train)
+    print(f"[DEBUG] Frame transform kwargs: {frame_transform_kwargs}", flush=True)
+    print(f"[DEBUG] Train mode: {train}", flush=True)
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
 
     # this seems to reduce memory usage without affecting speed
@@ -810,6 +812,16 @@ def make_interleaved_dataset(
             num_parallel_calls=threads,
             train=train,
         )
+        def debug_after_traj_transforms(x):
+            print(f"[AFTER TRAJ TRANSFORMS] Batch keys: {list(x.keys())}", flush=True)
+            if 'observation' in x:
+                obs = x['observation']
+                print(f"[AFTER TRAJ TRANSFORMS] Observation keys: {list(obs.keys())}", flush=True)
+                if 'proprio' in obs:
+                    print(f"[AFTER TRAJ TRANSFORMS] proprio shape: {obs['proprio'].shape}", flush=True)
+            return x
+        
+        dataset = dataset.map(debug_after_traj_transforms)
         dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
         datasets.append(dataset)
 
@@ -830,12 +842,66 @@ def make_interleaved_dataset(
     # Shuffle the Dataset
     #   =>> IMPORTANT :: Shuffle AFTER .cache(), or else memory will still leak!
     dataset = dataset.shuffle(shuffle_buffer_size)
+    
+    #######
+    # Add this test right before the frame transforms to see the actual data:
+    def test_single_batch(dataset):
+        """Test processing a single batch to identify the reshape issue"""
+        try:
+            for i, batch in enumerate(dataset.take(1).as_numpy_iterator()):
+                print(f"[TEST BATCH {i}] Successfully processed batch", flush=True)
+                print(f"[TEST BATCH {i}] Keys: {list(batch.keys())}", flush=True)
+                if 'observation' in batch:
+                    obs = batch['observation']
+                    print(f"[TEST BATCH {i}] Observation keys: {list(obs.keys())}", flush=True)
+                    for key, value in obs.items():
+                        if hasattr(value, 'shape'):
+                            print(f"[TEST BATCH {i}] {key} shape: {value.shape}", flush=True)
+                        else:
+                            print(f"[TEST BATCH {i}] {key} type: {type(value)}", flush=True)
+                return True
+        except Exception as e:
+            print(f"[TEST BATCH] Error: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return False
+
+    # Test before frame transforms
+    print("[DEBUG] Testing dataset before frame transforms...", flush=True)
+    success = test_single_batch(dataset)
+    print(f"[DEBUG] Before frame transforms test: {success}", flush=True)
+
+    if success:
+        dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
+        print("[DEBUG] Testing dataset after frame transforms...", flush=True)
+        success = test_single_batch(dataset)
+        print(f"[DEBUG] After frame transforms test: {success}", flush=True)
+        
+    #######
 
     # Apply Frame Transforms
     overwatch.info("Applying frame transforms on dataset...")
+    def debug_before_frame_transforms(x):
+        print(f"[BEFORE FRAME TRANSFORMS] Batch keys: {list(x.keys())}", flush=True)
+        if 'observation' in x:
+            obs = x['observation']
+            print(f"[BEFORE FRAME TRANSFORMS] Observation keys: {list(obs.keys())}", flush=True)
+            if 'proprio' in obs:
+                print(f"[BEFORE FRAME TRANSFORMS] proprio shape: {obs['proprio'].shape}, dtype: {obs['proprio'].dtype}", flush=True)
+            if 'image_primary' in obs:
+                img_shape = obs['image_primary'].shape if hasattr(obs['image_primary'], 'shape') else 'unknown'
+                print(f"[BEFORE FRAME TRANSFORMS] image_primary shape: {img_shape}", flush=True)
+        if 'action' in x:
+            print(f"[BEFORE FRAME TRANSFORMS] action shape: {x['action'].shape}, dtype: {x['action'].dtype}", flush=True)
+        if 'task' in x:
+            task = x['task']
+            print(f"[BEFORE FRAME TRANSFORMS] task keys: {list(task.keys())}", flush=True)
+        return x
+
+    dataset = dataset.map(debug_before_frame_transforms)
+    print(f"[DEBUG] Frame transform kwargs: {frame_transform_kwargs}", flush=True)
+    print(f"[DEBUG] Train mode: {train}", flush=True)
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
-    print(f"[AFTER TRANSFORMS]")
-    dataset = debug_shape_transforms(dataset)
     # [Contract] When training VLA Policies, we let the Collator handle Batching!
     if batch_size is not None:
         dataset = dataset.batch(batch_size)
