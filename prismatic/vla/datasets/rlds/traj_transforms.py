@@ -56,11 +56,11 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     
     # Make sure it's a scalar string (take the first element if it's a vector),
     # and avoid gathering over time to prevent rank/shape issues.
-    ds_name = traj["dataset_name"]
-    if tf.rank(ds_name) > 0:
-        # e.g. original OXE RLDS: shape [T] with the same string repeated
-        ds_name = ds_name[0]
-    traj["dataset_name"] = ds_name
+    # ds_name = traj["dataset_name"]
+    # if tf.rank(ds_name) > 0:
+    #     # e.g. original OXE RLDS: shape [T] with the same string repeated
+    #     ds_name = ds_name[0]
+    # traj["dataset_name"] = ds_name
 
     traj["absolute_action_mask"] = tf.gather(traj["absolute_action_mask"], tf.range(effective_traj_len))
 
