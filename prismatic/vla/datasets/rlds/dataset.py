@@ -670,11 +670,11 @@ def make_interleaved_dataset(
 
     for dataset_kwargs in dataset_kwargs_list:
         state_obs_key = dataset_kwargs.get("state_obs_keys")
-        if isinstance(state_obs_key, (list, tuple)):
-            if len(state_obs_key) > 1:
-                raise ValueError("TFRecord path only supports a single state_obs_key, got: "
-                                f"{state_obs_key}")
-            state_obs_key = state_obs_key[0]
+        state_obs_keys = dataset_kwargs.get("state_obs_keys")
+        if isinstance(state_obs_keys, (list, tuple)) and len(state_obs_keys) > 0:
+            state_obs_key = state_obs_keys[0]
+        else:
+            state_obs_key = state_obs_keys
         
         if "tfrecord_globs" in dataset_kwargs:
             ds, stats = make_dataset_from_tfrecord_globs(
@@ -837,7 +837,7 @@ import dlimp as dl
 def make_dataset_from_tfrecord_globs(
     tfrecord_globs,
     image_obs_keys,
-    state_obs_key,
+    state_obs_key,  # This should be a single key, not a list
     language_key,
     action_key,
     action_stats=None,
@@ -847,14 +847,20 @@ def make_dataset_from_tfrecord_globs(
     dataset_name="cdpr_local",
 ):
     DLataset = _get_dlatset_cls()
-    # 0) resolve files
     files = []
     for g in tfrecord_globs:
         gg = os.path.join(base_dir, g) if (base_dir and not os.path.isabs(g)) else g
         files.extend(sorted(glob.glob(gg)))
     if not files:
         raise FileNotFoundError(f"No TFRecords matched (base_dir={base_dir}): {tfrecord_globs}")
-    print("[CDPR] PROPRIO_DIM:", PROPRIO_DIM, "ACTION_DIM:", ACTION_DIM, flush=True)
+    
+    print(f"[CDPR] PROPRIO_DIM: {PROPRIO_DIM}, ACTION_DIM: {ACTION_DIM}", flush=True)
+    print(f"[CDPR] state_obs_key: {state_obs_key}", flush=True)
+
+    # Ensure state_obs_key is not a list
+    if isinstance(state_obs_key, (list, tuple)) and len(state_obs_key) > 0:
+        state_obs_key = state_obs_key[0]
+        print(f"[CDPR] Using state_obs_key: {state_obs_key}", flush=True)
 
     # 1) feature spec (matches your exporter)
     feature_spec = {
@@ -909,6 +915,17 @@ def make_dataset_from_tfrecord_globs(
             is_first = int(step["is_first"].numpy()[0]) == 1
             is_last  = int(step["is_last"].numpy()[0])  == 1
 
+            if is_first:
+                print(f"[CDPR DEBUG] First step - state shape: {state.shape}, action shape: {act.shape}", flush=True)
+
+            # Validate dimensions
+            if state.shape[0] != PROPRIO_DIM:
+                print(f"[CDPR WARNING] State dimension mismatch: expected {PROPRIO_DIM}, got {state.shape[0]}", flush=True)
+                # Continue or handle as needed
+                
+            if act.shape[0] != ACTION_DIM:
+                print(f"[CDPR WARNING] Action dimension mismatch: expected {ACTION_DIM}, got {act.shape[0]}", flush=True)
+            
             if is_first or not started:
                 if started and len(cur_act):
                     T = len(cur_act)

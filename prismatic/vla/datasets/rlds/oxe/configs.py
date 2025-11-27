@@ -710,28 +710,26 @@ OXE_DATASET_CONFIGS = {
 }
 
 # --- CDPR local (absolute TFRecord paths) -------------------------------------
+# In your configs.py
 OXE_DATASET_CONFIGS["cdpr_local"] = {
     "name": "cdpr_local",
     "tfrecord_globs": [
         "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/libero_spatial_no_noops/tfrecords/libero_spatial_no_noops-train-*.tfrecord",
     ],
     "image_obs_keys": {
-        # 👇 keys INSIDE observation
         "primary": "image_primary",
         "secondary": None,
         "wrist": "image_wrist",
     },
     "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-
-    "state_obs_keys": ["proprio"],
+    
+    # Use a single string instead of list
+    "state_obs_keys": "proprio",  # Changed from ["proprio"]
+    
     "state_encoding": StateEncoding.POS_EULER,
-
-    # 👇 matches "task": {"language_instruction": ...}
     "language_key": "task/language_instruction",
-
     "action_key": "action",
     "action_encoding": ActionEncoding.EEF_POS,
-
     "aux_kwargs": {},
 }
 
