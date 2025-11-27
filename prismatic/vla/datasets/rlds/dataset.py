@@ -869,7 +869,7 @@ def make_dataset_from_tfrecord_globs(
 
     def _parse(raw):
         ex = tf.io.parse_single_example(raw, feature_spec)
-        tf.print("[CDPR PARSE] keys:", list(ex.keys()))
+        # tf.print("[CDPR PARSE] keys:", list(ex.keys()))
         obs = {
             "primary": ex["observation/primary"],          # encoded PNG bytes
             "wrist":   ex["observation/wrist"],            # encoded PNG bytes
@@ -934,6 +934,10 @@ def make_dataset_from_tfrecord_globs(
 
             if is_last:
                 T = len(cur_act)
+                print("[CDPR EP] T:", T,
+                  "proprio shape:", ep["observation"]["proprio"].shape,
+                  "action shape:", ep["action"].shape,
+                  flush=True)
                 yield {
                     "observation": {
                         "image_primary": np.asarray(cur_prim, dtype=object),
@@ -952,6 +956,10 @@ def make_dataset_from_tfrecord_globs(
         # flush tail (if no is_last)
         if started and len(cur_act):
             T = len(cur_act)
+            print("[CDPR EP] T:", T,
+                  "proprio shape:", ep["observation"]["proprio"].shape,
+                  "action shape:", ep["action"].shape,
+                  flush=True)
             yield {
                 "observation": {
                     "image_primary": np.asarray(cur_prim, dtype=object),
@@ -966,19 +974,26 @@ def make_dataset_from_tfrecord_globs(
 
     # 3) Build a DLataset directly from the generator (NO tf.data anywhere)
     dl_dataset = DLataset.from_generator(
-        episode_generator,
-        output_signature={
-            "observation": {
-                "image_primary": tf.TensorSpec(shape=(None,), dtype=tf.string),
-                "image_wrist":   tf.TensorSpec(shape=(None,), dtype=tf.string),
-                "proprio":       tf.TensorSpec(shape=(None, None), dtype=tf.float32),
-                "timestep":      tf.TensorSpec(shape=(None,), dtype=tf.int32),
-            },
-            "task": {"language_instruction": tf.TensorSpec(shape=(None,), dtype=tf.string)},
-            "action":       tf.TensorSpec(shape=(None, None), dtype=tf.float32),
-            "dataset_name": tf.TensorSpec(shape=(None,), dtype=tf.string),
+    episode_generator,
+    output_signature={
+        "observation": {
+            "image_primary": tf.TensorSpec(shape=(None,), dtype=tf.string),
+            "image_wrist":   tf.TensorSpec(shape=(None,), dtype=tf.string),
+
+            # 👇 Each episode: [T, PROPRIO_DIM] = [T, 5]
+            "proprio":       tf.TensorSpec(shape=(None, PROPRIO_DIM), dtype=tf.float32),
+
+            "timestep":      tf.TensorSpec(shape=(None,), dtype=tf.int32),
         },
-    )
+        "task": {"language_instruction": tf.TensorSpec(shape=(None,), dtype=tf.string)},
+
+        # 👇 Each episode: [T, ACTION_DIM] = [T, 5]
+        "action":       tf.TensorSpec(shape=(None, ACTION_DIM), dtype=tf.float32),
+
+        "dataset_name": tf.TensorSpec(shape=(None,), dtype=tf.string),
+    },
+)
+
 
     # 4) Cheap stats …
     num_transitions = 0
