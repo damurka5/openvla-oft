@@ -842,7 +842,7 @@ def make_interleaved_dataset(
     DLataset = _get_dlatset_cls()
     dataset = DLataset.sample_from_datasets(datasets, sample_weights)
     dataset = _ensure_dldataset(dataset) 
-    dataset = debug_shape_transforms(dataset)
+    # dataset = debug_shape_transforms(dataset)
     # if train:
     #     dataset = dataset.repeat()
     # Make the training stream infinite without converting to tf.data
