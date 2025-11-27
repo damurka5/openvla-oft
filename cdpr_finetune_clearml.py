@@ -90,7 +90,7 @@ def main():
         "--vla_path",
         "moojink/openvla-7b-oft-finetuned-libero-spatial",
         "--data_root_dir",
-        data_root,  # still pass this in case other bits use it
+        data_root,
         "--dataset_name",
         "cdpr_local",
         "--run_root_dir",
@@ -105,7 +105,10 @@ def main():
         "1e-4",
         "--max_steps",
         "100",
+        "--image_aug",
+        "False",   # <-- add this
     ]
+
 
     print("Running command:", " ".join(cmd), flush=True)
     return subprocess.call(cmd)

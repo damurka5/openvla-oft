@@ -543,34 +543,90 @@ def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, 
     return img.numpy()
 
 
-def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.Tensor:
+# def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.Tensor:
+#     """
+#     Center-crop an image and resize it back to original dimensions.
+
+#     Uses the same logic as in the training data pipeline for distribution matching.
+
+#     Args:
+#         image: TF Tensor of shape (batch_size, H, W, C) or (H, W, C) with values in [0,1]
+#         crop_scale: Area of center crop relative to original image
+#         batch_size: Batch size
+
+#     Returns:
+#         tf.Tensor: The cropped and resized image
+#     """
+#     # Handle 3D inputs by adding batch dimension if needed
+#     assert image.shape.ndims in (3, 4), "Image must be 3D or 4D tensor"
+#     expanded_dims = False
+#     if image.shape.ndims == 3:
+#         image = tf.expand_dims(image, axis=0)
+#         expanded_dims = True
+
+#     # Calculate crop dimensions (note: we use sqrt(crop_scale) for h/w)
+#     new_heights = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
+#     new_widths = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
+
+#     # Create bounding box for the crop
+#     height_offsets = (1 - new_heights) / 2
+#     width_offsets = (1 - new_widths) / 2
+#     bounding_boxes = tf.stack(
+#         [
+#             height_offsets,
+#             width_offsets,
+#             height_offsets + new_heights,
+#             width_offsets + new_widths,
+#         ],
+#         axis=1,
+#     )
+
+#     # Apply crop and resize
+#     image = tf.image.crop_and_resize(
+#         image, bounding_boxes, tf.range(batch_size), (OPENVLA_IMAGE_SIZE, OPENVLA_IMAGE_SIZE)
+#     )
+
+#     # Remove batch dimension if it was added
+#     if expanded_dims:
+#         image = image[0]
+
+#     return image
+def crop_and_resize(image, crop_scale, batch_size):
     """
-    Center-crop an image and resize it back to original dimensions.
+    Center-crops an image to have area `crop_scale` * (original image area), and then resizes back
+    to original size.
 
-    Uses the same logic as in the training data pipeline for distribution matching.
-
-    Args:
-        image: TF Tensor of shape (batch_size, H, W, C) or (H, W, C) with values in [0,1]
-        crop_scale: Area of center crop relative to original image
-        batch_size: Batch size
-
-    Returns:
-        tf.Tensor: The cropped and resized image
+    This version is robust to mismatches between `crop_scale` shape and the `batch_size` arg.
     """
-    # Handle 3D inputs by adding batch dimension if needed
-    assert image.shape.ndims in (3, 4), "Image must be 3D or 4D tensor"
+    assert image.shape.ndims == 3 or image.shape.ndims == 4
     expanded_dims = False
     if image.shape.ndims == 3:
         image = tf.expand_dims(image, axis=0)
         expanded_dims = True
 
-    # Calculate crop dimensions (note: we use sqrt(crop_scale) for h/w)
-    new_heights = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
-    new_widths = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
+    # --- FIX: use dynamic batch_size inferred from the image ---
+    batch_size_dyn = tf.shape(image)[0]
 
-    # Create bounding box for the crop
-    height_offsets = (1 - new_heights) / 2
-    width_offsets = (1 - new_widths) / 2
+    # allow crop_scale to be scalar or vector; always reshape to (batch_size_dyn,)
+    crop_scale = tf.clip_by_value(tf.sqrt(crop_scale), 0, 1)
+    crop_scale_flat = tf.reshape(crop_scale, [-1])
+
+    # If crop_scale has only 1 element, broadcast it; otherwise use as-is (or slice)
+    def _broadcast():
+        return tf.ones([batch_size_dyn], dtype=crop_scale_flat.dtype) * crop_scale_flat[0]
+
+    def _maybe_slice():
+        # slice in case crop_scale has more than batch_size_dyn elements
+        return crop_scale_flat[:batch_size_dyn]
+
+    new_heights = tf.cond(
+        tf.equal(tf.size(crop_scale_flat), 1), _broadcast, _maybe_slice
+    )
+    new_widths = new_heights  # same logic
+
+    # Get bounding box representing crop
+    height_offsets = (1.0 - new_heights) / 2.0
+    width_offsets = (1.0 - new_widths) / 2.0
     bounding_boxes = tf.stack(
         [
             height_offsets,
@@ -581,16 +637,14 @@ def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.
         axis=1,
     )
 
-    # Apply crop and resize
-    image = tf.image.crop_and_resize(
-        image, bounding_boxes, tf.range(batch_size), (OPENVLA_IMAGE_SIZE, OPENVLA_IMAGE_SIZE)
-    )
+    # Use dynamic batch size here too
+    image = tf.image.crop_and_resize(image, bounding_boxes, tf.range(batch_size_dyn), (224, 224))
 
-    # Remove batch dimension if it was added
     if expanded_dims:
         image = image[0]
 
     return image
+
 
 
 def center_crop_image(image: Union[np.ndarray, Image.Image]) -> Image.Image:
