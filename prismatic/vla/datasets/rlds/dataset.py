@@ -854,6 +854,7 @@ def make_dataset_from_tfrecord_globs(
         files.extend(sorted(glob.glob(gg)))
     if not files:
         raise FileNotFoundError(f"No TFRecords matched (base_dir={base_dir}): {tfrecord_globs}")
+    print("[CDPR] PROPRIO_DIM:", PROPRIO_DIM, "ACTION_DIM:", ACTION_DIM, flush=True)
 
     # 1) feature spec (matches your exporter)
     feature_spec = {
@@ -960,10 +961,10 @@ def make_dataset_from_tfrecord_globs(
         # flush tail (if no is_last)
         if started and len(cur_act):
             T = len(cur_act)
-            print("[CDPR EP] T:", T,
-                  "proprio shape:", ep["observation"]["proprio"].shape,
-                  "action shape:", ep["action"].shape,
-                  flush=True)
+            # print("[CDPR EP] T:", T,
+            #       "proprio shape:", ep["observation"]["proprio"].shape,
+            #       "action shape:", ep["action"].shape,
+            #       flush=True)
             yield {
                 "observation": {
                     "image_primary": np.asarray(cur_prim, dtype=object),

@@ -934,21 +934,12 @@ OXE_STANDARDIZATION_TRANSFORMS = {
 # OXE_STANDARDIZATION_TRANSFORMS["cdpr_local"] = OXE_STANDARDIZATION_TRANSFORMS["libero_spatial_no_noops"]
 def cdpr_local_transform(trajectory):
     import tensorflow as tf
-
-    action = trajectory["action"]
-    obs = trajectory["observation"]
-
-    tf.print("[CDPR TRANSFORM] action shape:", tf.shape(action))
-    tf.print("[CDPR TRANSFORM] state shape:",
-             tf.shape(obs["state"]), summarize=-1)
-
-    # Now do the real work
-    action = tf.cast(action, tf.float32)
-    proprio = tf.cast(obs["state"], tf.float32)
-
-    obs["proprio"] = proprio
-    trajectory["action"] = action
-    trajectory["observation"] = obs
+    trajectory["action"] = tf.cast(trajectory["action"], tf.float32)
+    # 'proprio' already exists; just ensure dtype
+    trajectory["observation"]["proprio"] = tf.cast(
+        trajectory["observation"]["proprio"], tf.float32
+    )
     return trajectory
+
 
 OXE_STANDARDIZATION_TRANSFORMS["cdpr_local"] = cdpr_local_transform
