@@ -682,19 +682,40 @@ def make_interleaved_dataset(
     if len(dataset_kwargs_list) == 0:
         raise ValueError("No datasets were configured. Check dataset_name/mixture routing.")
 
+    print(f"[MAKE_INTERLEAVED] Received {len(dataset_kwargs_list)} dataset configs", flush=True)
+    for i, dataset_kwargs in enumerate(dataset_kwargs_list):
+        print(f"[MAKE_INTERLEAVED] Dataset {i}: {dataset_kwargs.get('name', 'unnamed')}", flush=True)
+        print(f"[MAKE_INTERLEAVED]   state_obs_keys: {dataset_kwargs.get('state_obs_keys')}", flush=True)
+        print(f"[MAKE_INTERLEAVED]   image_obs_keys: {dataset_kwargs.get('image_obs_keys')}", flush=True)
+        print(f"[MAKE_INTERLEAVED]   tfrecord_globs: {dataset_kwargs.get('tfrecord_globs')}", flush=True)
+        
     datasets = []
     stats_list = []
     dataset_sizes = []
     all_dataset_statistics = {}
 
     for dataset_kwargs in dataset_kwargs_list:
+        # Extract state_obs_key with proper fallback
         state_obs_keys = dataset_kwargs.get("state_obs_keys")
-        if isinstance(state_obs_keys, (list, tuple)) and len(state_obs_keys) > 0:
-            state_obs_key = state_obs_keys[0]
-        else:
-            state_obs_key = state_obs_keys
+        print(f"[DEBUG] Raw state_obs_keys from config: {state_obs_keys}", flush=True)
         
-        print(f"[CDPR INTERLEAVE] Processing dataset: {dataset_kwargs.get('name')}, state_obs_key: {state_obs_key}", flush=True)
+        if state_obs_keys is None:
+            print("[DEBUG] WARNING: state_obs_keys is None, using default 'proprio'", flush=True)
+            state_obs_key = "proprio"
+        elif isinstance(state_obs_keys, (list, tuple)) and len(state_obs_keys) > 0:
+            state_obs_key = state_obs_keys[0]
+            print(f"[DEBUG] Using first state_obs_key from list: {state_obs_key}", flush=True)
+        elif isinstance(state_obs_keys, str):
+            state_obs_key = state_obs_keys
+            print(f"[DEBUG] Using string state_obs_key: {state_obs_key}", flush=True)
+        else:
+            state_obs_key = "proprio"  # fallback
+            print(f"[DEBUG] Unexpected state_obs_keys type {type(state_obs_keys)}, using fallback: {state_obs_key}", flush=True)
+        
+        # Force the state_obs_key to be set in the kwargs for the TFRecord function
+        dataset_kwargs["state_obs_keys"] = [state_obs_key]  # Ensure it's a list
+        
+        print(f"[DEBUG] Final state_obs_key for dataset: {state_obs_key}", flush=True)
         
         if "tfrecord_globs" in dataset_kwargs:
             ds, stats = make_dataset_from_tfrecord_globs(
@@ -708,14 +729,6 @@ def make_interleaved_dataset(
                 shuffle_buffer_size=shuffle_buffer_size,
                 base_dir=dataset_kwargs.get("data_root_dir") or None,
                 dataset_name=dataset_kwargs.get("name", "cdpr_local"),
-            )
-        else:
-            ds, stats = make_dataset_from_rlds(
-                **dataset_kwargs,
-                train=train,
-                num_parallel_calls=traj_transform_threads,
-                num_parallel_reads=traj_read_threads,
-                dataset_statistics=None,
             )
         # ds = _ensure_dldataset(ds)
         # stats_list.append(stats)
@@ -881,24 +894,27 @@ def make_interleaved_dataset(
 
     # Apply Frame Transforms
     overwatch.info("Applying frame transforms on dataset...")
-    def debug_before_frame_transforms(x):
-        print(f"[BEFORE FRAME TRANSFORMS] Batch keys: {list(x.keys())}", flush=True)
-        if 'observation' in x:
-            obs = x['observation']
-            print(f"[BEFORE FRAME TRANSFORMS] Observation keys: {list(obs.keys())}", flush=True)
-            if 'proprio' in obs:
-                print(f"[BEFORE FRAME TRANSFORMS] proprio shape: {obs['proprio'].shape}, dtype: {obs['proprio'].dtype}", flush=True)
-            if 'image_primary' in obs:
-                img_shape = obs['image_primary'].shape if hasattr(obs['image_primary'], 'shape') else 'unknown'
-                print(f"[BEFORE FRAME TRANSFORMS] image_primary shape: {img_shape}", flush=True)
-        if 'action' in x:
-            print(f"[BEFORE FRAME TRANSFORMS] action shape: {x['action'].shape}, dtype: {x['action'].dtype}", flush=True)
-        if 'task' in x:
-            task = x['task']
-            print(f"[BEFORE FRAME TRANSFORMS] task keys: {list(task.keys())}", flush=True)
-        return x
+    def create_debug_wrapper(transform_name):
+        def debug_function(x):
+            print(f"[{transform_name}] Sample keys: {list(x.keys())}", flush=True)
+            if 'observation' in x:
+                obs = x['observation']
+                print(f"[{transform_name}] Observation keys: {list(obs.keys())}", flush=True)
+                if 'proprio' in obs:
+                    print(f"[{transform_name}] proprio shape: {obs['proprio'].shape}", flush=True)
+                if 'image_primary' in obs:
+                    img_shape = obs['image_primary'].shape if hasattr(obs['image_primary'], 'shape') else 'unknown'
+                    print(f"[{transform_name}] image_primary shape: {img_shape}", flush=True)
+            if 'action' in x:
+                print(f"[{transform_name}] action shape: {x['action'].shape}", flush=True)
+            return x
+        return debug_function
 
-    dataset = dataset.map(debug_before_frame_transforms)
+    # Apply debugging using the proper DLataset method
+    if hasattr(dataset, 'map'):
+        dataset = dataset.map(create_debug_wrapper("AFTER_TRAJ_TRANSFORMS"))
+    else:
+        print("[DEBUG] Dataset does not have map method after trajectory transforms", flush=True)
     print(f"[DEBUG] Frame transform kwargs: {frame_transform_kwargs}", flush=True)
     print(f"[DEBUG] Train mode: {train}", flush=True)
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
