@@ -722,8 +722,8 @@ OXE_DATASET_CONFIGS["cdpr_local"] = {
     },
     "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
 
-    "state_obs_keys": ["state"],
-    "state_encoding": StateEncoding.POS_EULER,  # or POS_EULER if FLAT doesn’t exist
+    "state_obs_keys": ["proprio"],
+    "state_encoding": StateEncoding.FLAT,  # or POS_EULER if FLAT doesn’t exist
 
     "language_key": "observation/task_description",
     "action_key": "action",

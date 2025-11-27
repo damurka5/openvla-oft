@@ -931,4 +931,19 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "aloha1_scoop_X_into_bowl_45_demos": aloha_dataset_transform,
     "aloha1_put_X_into_pot_300_demos": aloha_dataset_transform,
 }
-OXE_STANDARDIZATION_TRANSFORMS["cdpr_local"] = OXE_STANDARDIZATION_TRANSFORMS["libero_spatial_no_noops"]
+# OXE_STANDARDIZATION_TRANSFORMS["cdpr_local"] = OXE_STANDARDIZATION_TRANSFORMS["libero_spatial_no_noops"]
+def cdpr_local_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    # Ensure float32 and correct shapes
+    trajectory["action"] = tf.cast(trajectory["action"], tf.float32)
+
+    # If your TFRecord has observation["state"] with shape [T, 5],
+    # just treat it as proprio:
+    trajectory["observation"]["proprio"] = tf.cast(
+        trajectory["observation"]["state"], tf.float32
+    )
+
+    # (Optionally: if there is any dummy first step to drop, do it here.)
+    return trajectory
+
+
+OXE_STANDARDIZATION_TRANSFORMS["cdpr_local"] = cdpr_local_transform
