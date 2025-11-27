@@ -669,6 +669,13 @@ def make_interleaved_dataset(
     all_dataset_statistics = {}
 
     for dataset_kwargs in dataset_kwargs_list:
+        state_obs_key = dataset_kwargs.get("state_obs_keys")
+        if isinstance(state_obs_key, (list, tuple)):
+            if len(state_obs_key) > 1:
+                raise ValueError("TFRecord path only supports a single state_obs_key, got: "
+                                f"{state_obs_key}")
+            state_obs_key = state_obs_key[0]
+        
         if "tfrecord_globs" in dataset_kwargs:
             ds, stats = make_dataset_from_tfrecord_globs(
                 tfrecord_globs=dataset_kwargs["tfrecord_globs"],
@@ -748,6 +755,13 @@ def make_interleaved_dataset(
              if "dataset_frame_transform_kwargs" in dataset_kwargs
              else {}
          )
+        state_obs_key = dataset_kwargs.get("state_obs_keys")
+        if isinstance(state_obs_key, (list, tuple)):
+            if len(state_obs_key) > 1:
+                raise ValueError("TFRecord path only supports a single state_obs_key, got: "
+                                f"{state_obs_key}")
+            state_obs_key = state_obs_key[0]
+            
         if "tfrecord_globs" in dataset_kwargs:
             dataset, dataset_statistics = make_dataset_from_tfrecord_globs(
                 tfrecord_globs=dataset_kwargs["tfrecord_globs"],
@@ -855,6 +869,7 @@ def make_dataset_from_tfrecord_globs(
 
     def _parse(raw):
         ex = tf.io.parse_single_example(raw, feature_spec)
+        tf.print("[CDPR PARSE] keys:", list(ex.keys()))
         obs = {
             "primary": ex["observation/primary"],          # encoded PNG bytes
             "wrist":   ex["observation/wrist"],            # encoded PNG bytes
