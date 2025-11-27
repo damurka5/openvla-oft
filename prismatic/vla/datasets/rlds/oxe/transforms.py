@@ -942,4 +942,4 @@ def cdpr_local_transform(trajectory):
     return trajectory
 
 
-OXE_STANDARDIZATION_TRANSFORMS["cdpr_local"] = cdpr_local_transform
+# OXE_STANDARDIZATION_TRANSFORMS["cdpr_local"] = cdpr_local_transform

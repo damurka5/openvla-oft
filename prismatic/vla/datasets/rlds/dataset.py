@@ -921,8 +921,8 @@ def make_dataset_from_tfrecord_globs(
                         },
                         "task": {"language_instruction": np.asarray(cur_lang, dtype=object)},
                         "action":       np.stack(cur_act, axis=0).astype(np.float32),
-                        # "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
-                        "dataset_name": dataset_name.encode(),
+                        "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
+                        # "dataset_name": dataset_name.encode(),
 
                     }
                 cur_prim, cur_wrist, cur_state = [], [], []
@@ -950,8 +950,8 @@ def make_dataset_from_tfrecord_globs(
                     },
                     "task": {"language_instruction": np.asarray(cur_lang, dtype=object)},
                     "action":       np.stack(cur_act, axis=0).astype(np.float32),
-                    # "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
-                    "dataset_name": dataset_name.encode(),
+                    "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
+                    # "dataset_name": dataset_name.encode(),
 
                 }
                 cur_prim, cur_wrist, cur_state = [], [], []
@@ -974,8 +974,8 @@ def make_dataset_from_tfrecord_globs(
                 },
                 "task": {"language_instruction": np.asarray(cur_lang, dtype=object)},
                 "action":       np.stack(cur_act, axis=0).astype(np.float32),
-                # "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
-                "dataset_name": dataset_name.encode(),
+                "dataset_name": np.asarray([dataset_name.encode()] * T, dtype=object),
+                # "dataset_name": dataset_name.encode(),
 
             }
 
@@ -998,7 +998,8 @@ def make_dataset_from_tfrecord_globs(
         "action":       tf.TensorSpec(shape=(None, ACTION_DIM), dtype=tf.float32),
 
         # "dataset_name": tf.TensorSpec(shape=(None,), dtype=tf.string),
-        "dataset_name": tf.TensorSpec(shape=(), dtype=tf.string),
+        # "dataset_name": tf.TensorSpec(shape=(), dtype=tf.string),
+        "dataset_name": tf.TensorSpec(shape=(None,), dtype=tf.string),
 
     },
 )
