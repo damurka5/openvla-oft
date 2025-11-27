@@ -730,7 +730,7 @@ OXE_DATASET_CONFIGS["cdpr_local"] = {
     "action_encoding": ActionEncoding.EEF_POS,
 
     "aux_kwargs": {
-        "action_stats": "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/action_stats_libero_spatial_no_noops.json",
+        # "action_stats": "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/action_stats_libero_spatial_no_noops.json",
     },
 }
 
