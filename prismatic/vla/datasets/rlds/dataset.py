@@ -935,8 +935,8 @@ def make_dataset_from_tfrecord_globs(
             if is_last:
                 T = len(cur_act)
                 print("[CDPR EP] T:", T,
-                  "proprio shape:", ep["observation"]["proprio"].shape,
-                  "action shape:", ep["action"].shape,
+                  "proprio shape:", np.stack(cur_state, axis=0).astype(np.float32).shape,
+                  "action shape:", np.stack(cur_act, axis=0).astype(np.float32).shape,
                   flush=True)
                 yield {
                     "observation": {
