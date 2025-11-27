@@ -710,7 +710,6 @@ OXE_DATASET_CONFIGS = {
 }
 
 # --- CDPR local (absolute TFRecord paths) -------------------------------------
-# In your configs.py
 OXE_DATASET_CONFIGS["cdpr_local"] = {
     "name": "cdpr_local",
     "tfrecord_globs": [
@@ -723,12 +722,12 @@ OXE_DATASET_CONFIGS["cdpr_local"] = {
     },
     "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
     
-    # Use a single string instead of list
-    "state_obs_keys": "proprio",  # Changed from ["proprio"]
+    # Fix: Use a list with single element instead of string
+    "state_obs_keys": ["proprio"],  # Keep as list with one element
     
     "state_encoding": StateEncoding.POS_EULER,
     "language_key": "task/language_instruction",
-    "action_key": "action",
+    "action_key": "action", 
     "action_encoding": ActionEncoding.EEF_POS,
     "aux_kwargs": {},
 }

@@ -610,6 +610,23 @@ def make_single_dataset(
     # save for later
     return dataset, dataset_statistics["num_trajectories"], dataset_statistics
 
+def debug_shape_transforms(dataset):
+    """Add shape debugging to dataset transforms"""
+    def print_shapes(x):
+        print(f"[SHAPE DEBUG] Batch keys: {list(x.keys())}", flush=True)
+        if 'observation' in x:
+            obs = x['observation']
+            print(f"[SHAPE DEBUG] Observation keys: {list(obs.keys())}", flush=True)
+            if 'proprio' in obs:
+                print(f"[SHAPE DEBUG] proprio shape: {obs['proprio'].shape}", flush=True)
+            if 'image_primary' in obs:
+                print(f"[SHAPE DEBUG] image_primary shape: {obs['image_primary'].shape}", flush=True)
+        if 'action' in x:
+            print(f"[SHAPE DEBUG] action shape: {x['action'].shape}", flush=True)
+        return x
+    
+    return dataset.map(print_shapes)
+
 # === Core Initializer ===
 def make_interleaved_dataset(
     dataset_kwargs_list: List[Dict],
@@ -669,18 +686,19 @@ def make_interleaved_dataset(
     all_dataset_statistics = {}
 
     for dataset_kwargs in dataset_kwargs_list:
-        state_obs_key = dataset_kwargs.get("state_obs_keys")
         state_obs_keys = dataset_kwargs.get("state_obs_keys")
         if isinstance(state_obs_keys, (list, tuple)) and len(state_obs_keys) > 0:
             state_obs_key = state_obs_keys[0]
         else:
             state_obs_key = state_obs_keys
         
+        print(f"[CDPR INTERLEAVE] Processing dataset: {dataset_kwargs.get('name')}, state_obs_key: {state_obs_key}", flush=True)
+        
         if "tfrecord_globs" in dataset_kwargs:
             ds, stats = make_dataset_from_tfrecord_globs(
                 tfrecord_globs=dataset_kwargs["tfrecord_globs"],
                 image_obs_keys=dataset_kwargs.get("image_obs_keys", {}),
-                state_obs_key=dataset_kwargs.get("state_obs_keys"),
+                state_obs_key=state_obs_key,  # Pass the extracted key
                 language_key=dataset_kwargs.get("language_key"),
                 action_key=dataset_kwargs.get("action_key"),
                 action_stats=(dataset_kwargs.get("aux_kwargs", {}) or {}).get("action_stats"),
@@ -799,6 +817,7 @@ def make_interleaved_dataset(
     DLataset = _get_dlatset_cls()
     dataset = DLataset.sample_from_datasets(datasets, sample_weights)
     dataset = _ensure_dldataset(dataset) 
+    dataset = debug_shape_transforms(dataset)
     # if train:
     #     dataset = dataset.repeat()
     # Make the training stream infinite without converting to tf.data
@@ -815,7 +834,8 @@ def make_interleaved_dataset(
     # Apply Frame Transforms
     overwatch.info("Applying frame transforms on dataset...")
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
-
+    print(f"[AFTER TRANSFORMS]")
+    dataset = debug_shape_transforms(dataset)
     # [Contract] When training VLA Policies, we let the Collator handle Batching!
     if batch_size is not None:
         dataset = dataset.batch(batch_size)
@@ -837,7 +857,7 @@ import dlimp as dl
 def make_dataset_from_tfrecord_globs(
     tfrecord_globs,
     image_obs_keys,
-    state_obs_key,  # This should be a single key, not a list
+    state_obs_key,  # This might be a list or None
     language_key,
     action_key,
     action_stats=None,
@@ -857,11 +877,16 @@ def make_dataset_from_tfrecord_globs(
     print(f"[CDPR] PROPRIO_DIM: {PROPRIO_DIM}, ACTION_DIM: {ACTION_DIM}", flush=True)
     print(f"[CDPR] state_obs_key: {state_obs_key}", flush=True)
 
-    # Ensure state_obs_key is not a list
-    if isinstance(state_obs_key, (list, tuple)) and len(state_obs_key) > 0:
-        state_obs_key = state_obs_key[0]
-        print(f"[CDPR] Using state_obs_key: {state_obs_key}", flush=True)
-
+    # Handle the case where state_obs_key might be a list or None
+    effective_state_key = "proprio"  # default
+    if state_obs_key is not None:
+        if isinstance(state_obs_key, (list, tuple)) and len(state_obs_key) > 0:
+            effective_state_key = state_obs_key[0]
+        elif isinstance(state_obs_key, str):
+            effective_state_key = state_obs_key
+    
+    print(f"[CDPR] Using effective_state_key: {effective_state_key}", flush=True)
+    
     # 1) feature spec (matches your exporter)
     feature_spec = {
         "observation/primary": tf.io.FixedLenFeature([], tf.string),
