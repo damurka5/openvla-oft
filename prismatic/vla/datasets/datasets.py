@@ -32,6 +32,33 @@ def debug_actions(actions):
     print(f"[DEBUG ACTIONS] Sample values: {actions[:2] if len(actions) > 2 else actions}", flush=True)
     return actions
 
+# Debug what the action tokenizer expects
+def debug_action_tokenizer(action_tokenizer, sample_action):
+    """Debug what the action tokenizer can handle"""
+    print(f"[DEBUG ACTION TOKENIZER] Sample action shape: {sample_action.shape}, dtype: {sample_action.dtype}", flush=True)
+    
+    # Try different input formats
+    try:
+        # Try as numpy array
+        result1 = action_tokenizer(sample_action)
+        print(f"[DEBUG ACTION TOKENIZER] Numpy array works: {result1}", flush=True)
+    except Exception as e:
+        print(f"[DEBUG ACTION TOKENIZER] Numpy array failed: {e}", flush=True)
+    
+    try:
+        # Try as torch tensor
+        result2 = action_tokenizer(torch.tensor(sample_action))
+        print(f"[DEBUG ACTION TOKENIZER] Torch tensor works: {result2}", flush=True)
+    except Exception as e:
+        print(f"[DEBUG ACTION TOKENIZER] Torch tensor failed: {e}", flush=True)
+    
+    try:
+        # Try as list
+        result3 = action_tokenizer(sample_action.tolist())
+        print(f"[DEBUG ACTION TOKENIZER] List works: {result3}", flush=True)
+    except Exception as e:
+        print(f"[DEBUG ACTION TOKENIZER] List failed: {e}", flush=True)
+
 @dataclass
 class RLDSBatchTransform:
     action_tokenizer: ActionTokenizer
@@ -101,7 +128,7 @@ class RLDSBatchTransform:
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
+        dataset_name = rlds_batch["dataset_name"]
         
         # FIX: Convert float32 images to uint8 for PIL
         image_primary_data = rlds_batch["observation"]["image_primary"][0]
@@ -109,46 +136,46 @@ class RLDSBatchTransform:
             image_primary_data = (image_primary_data * 255).astype(np.uint8)
         img = Image.fromarray(image_primary_data)
         
-        # FIX: Handle language instruction (could be bytes or already decoded)
+        # FIX: Handle language instruction
         lang_instruction = rlds_batch["task"]["language_instruction"]
         if hasattr(lang_instruction, 'decode'):
             lang = lang_instruction.decode().lower()
         else:
-            # It's a numpy array of bytes - take the first element and decode
             lang = lang_instruction[0].decode().lower() if isinstance(lang_instruction, np.ndarray) else str(lang_instruction).lower()
         
         actions = rlds_batch["action"]
-        
         print(f"[DEBUG] Actions shape: {actions.shape}, dtype: {actions.dtype}", flush=True)
-        print(f"[DEBUG] Current action: {current_action}, type: {type(current_action)}", flush=True)
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
 
-        # Get future action chunk - FIX: Ensure we're passing the right data type
-        future_actions = rlds_batch["action"][1:]
-        print(f"[DEBUG] Future actions shape: {future_actions.shape}", flush=True)
+        # FIX: Actions are already chunked! Shape is (batch_size, num_chunks, action_dim)
+        # We need to take the first chunk as current action and the rest as future actions
+        # Current action should be the first chunk of the first timestep
+        current_action_chunk = actions[0]  # Shape: (8, 5) - 8 action chunks
+        print(f"[DEBUG] Current action chunk shape: {current_action_chunk.shape}", flush=True)
         
-        # FIX: Convert actions to the right format for the tokenizer
+        # Future actions are the remaining timesteps (all their chunks)
+        future_actions = actions[1:]  # Shape: (749, 8, 5)
+        print(f"[DEBUG] Future actions shape: {future_actions.shape}", flush=True)
+
+        # FIX: Tokenize each action chunk individually
         try:
-            future_actions_string = ''.join(self.action_tokenizer(future_actions))
+            # Tokenize the first action chunk as current action
+            current_action_string = ''.join([self.action_tokenizer(chunk) for chunk in current_action_chunk])
+            
+            # Tokenize future action chunks
+            future_actions_string = ''
+            for timestep_actions in future_actions:
+                for action_chunk in timestep_actions:
+                    future_actions_string += self.action_tokenizer(action_chunk)
+                    
         except Exception as e:
             print(f"[ERROR] Action tokenizer failed: {e}", flush=True)
-            print(f"[DEBUG] Future actions type: {type(future_actions)}, dtype: {future_actions.dtype}", flush=True)
-            # Try converting to the right format
-            if isinstance(future_actions, np.ndarray):
-                future_actions = future_actions.astype(np.float32)
-            future_actions_string = ''.join(self.action_tokenizer(future_actions))
+            # Fallback: use empty strings
+            current_action_string = ''
+            future_actions_string = ''
 
-        # Get action chunk string - FIX: Handle current action properly
-        try:
-            current_action_string = self.action_tokenizer(current_action)
-        except Exception as e:
-            print(f"[ERROR] Current action tokenizer failed: {e}", flush=True)
-            if isinstance(current_action, np.ndarray):
-                current_action = current_action.astype(np.float32)
-            current_action_string = self.action_tokenizer(current_action)
-        
         action_chunk_string = current_action_string + future_actions_string
         action_chunk_len = len(action_chunk_string)
 
@@ -164,7 +191,6 @@ class RLDSBatchTransform:
         labels = list(input_ids)
 
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
-        #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
 
@@ -175,7 +201,6 @@ class RLDSBatchTransform:
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
 
-        # Add additional inputs - FIX wrist images too
         if self.use_wrist_image:
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
@@ -191,11 +216,9 @@ class RLDSBatchTransform:
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
-            
-        debug_actions(rlds_batch["action"])
-        debug_actions(current_action)
-        debug_actions(future_actions)
-
+        
+        debug_action_tokenizer(self.action_tokenizer, actions[0, 0])
+        
         return return_dict
 
 class RLDSDataset(IterableDataset):
