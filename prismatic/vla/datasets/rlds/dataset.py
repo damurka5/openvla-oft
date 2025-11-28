@@ -558,9 +558,8 @@ def custom_decode_and_resize(obs, resize_size=None):
     return obs
 
 def apply_frame_transforms(dataset, resize_size=(224, 224), num_parallel_calls=None, train=True):
-    """Apply frame-level transforms to the dataset."""
+    """Apply frame-level transforms to the dataset - fixed version"""
     
-    # Convert resize_size to dict format
     if isinstance(resize_size, tuple):
         resize_size_dict = {
             "image_primary": resize_size,
@@ -572,20 +571,32 @@ def apply_frame_transforms(dataset, resize_size=(224, 224), num_parallel_calls=N
     print(f"[DEBUG FRAME TRANSFORMS] resize_size_dict: {resize_size_dict}", flush=True)
     
     def frame_transform_fn(frame):
-        """Transform function for each frame"""
+        """Transform function for each frame - only process if needed"""
         print(f"[DEBUG FRAME TRANSFORM] Frame keys: {list(frame.keys())}", flush=True)
         
-        # Apply the custom decode and resize to observation
-        frame["observation"] = custom_decode_and_resize(frame["observation"], resize_size_dict)
+        obs = frame["observation"]
+        
+        # Check if images are already processed
+        image_keys = ["image_primary", "image_wrist"]
+        needs_processing = False
+        
+        for key in image_keys:
+            if key in obs and obs[key] is not None:
+                # If image has rank 2 ([batch, 1]), it needs decoding
+                if len(obs[key].shape) == 2 and obs[key].shape[-1] == 1:
+                    needs_processing = True
+                    break
+        
+        # Only apply transforms if images need processing
+        if needs_processing:
+            print(f"[DEBUG FRAME TRANSFORM] Images need processing, applying transforms", flush=True)
+            frame["observation"] = custom_decode_and_resize(obs, resize_size_dict)
+        else:
+            print(f"[DEBUG FRAME TRANSFORM] Images already processed, skipping", flush=True)
         
         return frame
     
-    # Apply the transforms
-    dataset = dataset.frame_map(
-        frame_transform_fn, 
-        num_parallel_calls=num_parallel_calls
-    )
-    
+    dataset = dataset.frame_map(frame_transform_fn, num_parallel_calls=num_parallel_calls)
     return dataset
 
 # def apply_frame_transforms(
@@ -891,12 +902,27 @@ def make_interleaved_dataset(
 
         dataset = _ensure_dldataset(dataset)
             
+        def trace_image_processing(dataset, stage_name):
+            """Trace where images get processed in the pipeline"""
+            def trace_fn(frame):
+                obs = frame["observation"]
+                for key in ["image_primary", "image_wrist"]:
+                    if key in obs:
+                        print(f"[TRACE {stage_name}] {key}: shape={obs[key].shape}, dtype={obs[key].dtype}", flush=True)
+                return frame
+            return dataset.frame_map(trace_fn)
+
+        # Add these traces throughout your pipeline
+        dataset = trace_image_processing(dataset, "BEFORE_TRAJECTORY_TRANSFORMS")
+            
         dataset = apply_trajectory_transforms(
             dataset,
             **traj_transform_kwargs,
             num_parallel_calls=threads,
             train=train,
         )
+        dataset = trace_image_processing(dataset, "AFTER_TRAJECTORY_TRANSFORMS")
+        
         def debug_after_traj_transforms(x):
             print(f"[AFTER TRAJ TRANSFORMS] Batch keys: {list(x.keys())}", flush=True)
             if 'observation' in x:
@@ -908,6 +934,7 @@ def make_interleaved_dataset(
         
         # dataset = dataset.map(debug_after_traj_transforms)
         dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
+        dataset = trace_image_processing(dataset, "AFTER_PER_DATASET_TRANSFORMS")
         datasets.append(dataset)
 
     # Interleave at the Frame Level
