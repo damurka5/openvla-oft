@@ -516,7 +516,7 @@ def apply_per_dataset_frame_transforms(
     return dataset
 
 def custom_decode_and_resize(obs, resize_size=None):
-    """Custom decode function that handles your image format"""
+    """Custom decode function that handles batched image data"""
     if resize_size is None:
         resize_size = {}
     
@@ -527,24 +527,33 @@ def custom_decode_and_resize(obs, resize_size=None):
     
     for key in image_keys:
         if key in obs and obs[key] is not None:
-            print(f"[DEBUG CUSTOM DECODE] Processing {key}, type: {type(obs[key])}", flush=True)
+            print(f"[DEBUG CUSTOM DECODE] Processing {key}, shape: {obs[key].shape}, dtype: {obs[key].dtype}", flush=True)
             
-            # Decode the image from bytes
-            image = tf.io.decode_image(obs[key], channels=3, expand_animations=False)
+            # The images are batched, so we need to decode each one individually
+            # Shape: [batch_size, 1] where each element is encoded image bytes
             
-            # Ensure the image has the right dtype and shape
-            image = tf.cast(image, tf.float32) / 255.0
+            def decode_single_image(encoded_image):
+                """Decode a single image from bytes"""
+                # Remove the extra dimension and decode
+                image_bytes = tf.reshape(encoded_image, [])
+                image = tf.io.decode_image(image_bytes, channels=3, expand_animations=False)
+                image = tf.cast(image, tf.float32) / 255.0
+                
+                # Resize if specified
+                if key in resize_size:
+                    image = tf.image.resize(image, resize_size[key], method="lanczos3", antialias=True)
+                
+                return image
             
-            print(f"[DEBUG CUSTOM DECODE] {key} decoded shape: {image.shape}", flush=True)
+            # Apply decoding to each image in the batch
+            decoded_images = tf.map_fn(
+                decode_single_image,
+                obs[key],
+                fn_output_signature=tf.TensorSpec(shape=(None, None, 3), dtype=tf.float32)
+            )
             
-            # Resize if specified for this key
-            if key in resize_size:
-                target_size = resize_size[key]
-                print(f"[DEBUG CUSTOM DECODE] Resizing {key} to {target_size}", flush=True)
-                image = tf.image.resize(image, target_size, method="lanczos3", antialias=True)
-                print(f"[DEBUG CUSTOM DECODE] {key} resized shape: {image.shape}", flush=True)
-            
-            obs[key] = image
+            print(f"[DEBUG CUSTOM DECODE] {key} decoded shape: {decoded_images.shape}", flush=True)
+            obs[key] = decoded_images
     
     return obs
 
