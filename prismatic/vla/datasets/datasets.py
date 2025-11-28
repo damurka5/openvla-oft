@@ -161,17 +161,21 @@ class RLDSBatchTransform:
         
         actions = rlds_batch["action"]
         print(f"[DEBUG] Actions shape: {actions.shape}, dtype: {actions.dtype}", flush=True)
+        test_action = actions[0, 0]
+        tokenized_test = self.action_tokenizer(test_action)
+        print(f"[DEBUG ACTION TOKENIZER] Single action tokens: '{tokenized_test}'", flush=True)
+        print(f"[DEBUG ACTION TOKENIZER] Single action token length: {len(tokenized_test)}", flush=True)
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
 
         # FIX: Use only the first action chunk from the first timestep
         current_action = actions[0, 0]  # Shape: (5,) - single action
-        print(f"[DEBUG] Current action shape: {current_action.shape}", flush=True)
         
-        # Future actions: take first chunk from remaining timesteps
-        future_actions = actions[1:, 0]  # Shape: (749, 5)
-        print(f"[DEBUG] Future actions shape: {future_actions.shape}", flush=True)
+        # FIX: Limit future actions to prevent sequence from being too long
+        max_future_actions = 10  # Limit to prevent sequence overflow
+        future_actions = actions[1:1+max_future_actions, 0]  # Shape: (max_future_actions, 5)
+        print(f"[DEBUG] Limited future actions shape: {future_actions.shape}", flush=True)
 
         # FIX: Tokenize actions properly
         try:
@@ -185,6 +189,9 @@ class RLDSBatchTransform:
         action_chunk_string = current_action_string + future_actions_string
         action_chunk_len = len(action_chunk_string)
 
+        print(f"[DEBUG TOKENS] Action chunk string length: {action_chunk_len}", flush=True)
+        print(f"[DEBUG TOKENS] Action chunk preview: {action_chunk_string[:100]}...", flush=True)
+
         conversation = [
             {"from": "human", "value": f"What action should the robot take to {lang}?"},
             {"from": "gpt", "value": action_chunk_string},
@@ -195,6 +202,9 @@ class RLDSBatchTransform:
         # Tokenize (w/ `base_tokenizer`)
         input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
         labels = list(input_ids)
+
+        print(f"[DEBUG TOKENS] Total input IDs length: {len(input_ids)}", flush=True)
+        print(f"[DEBUG TOKENS] Base tokenizer vocab size: {self.base_tokenizer.vocab_size}", flush=True)
 
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
@@ -219,28 +229,23 @@ class RLDSBatchTransform:
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
         
-        # FIX: Handle proprioception data shape
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             print(f"[DEBUG] Proprio shape: {proprio.shape}, dtype: {proprio.dtype}", flush=True)
             
-            # The proprio data is likely chunked like actions. We need to take the first timestep.
-            # Expected shape for proprio projector: (batch_size, 5) or similar
-            if len(proprio.shape) == 3:  # Shape: (batch_size, num_chunks, proprio_dim)
-                # Take the first timestep and first chunk
-                proprio = proprio[0, 0]  # Shape: (5,)
-                print(f"[DEBUG] Taking first proprio chunk: {proprio.shape}", flush=True)
-            elif len(proprio.shape) == 2:  # Shape: (batch_size, proprio_dim)
-                # Take the first timestep
-                proprio = proprio[0]  # Shape: (5,)
-                print(f"[DEBUG] Taking first proprio: {proprio.shape}", flush=True)
+            # Take the first timestep and first chunk
+            if len(proprio.shape) == 3:
+                proprio_processed = proprio[0, 0]
+            else:
+                proprio_processed = proprio[0]
             
-            # Ensure it's the right shape and convert to tensor
-            proprio = torch.tensor(proprio, dtype=torch.float32).unsqueeze(0)  # Shape: (1, 5)
-            print(f"[DEBUG] Final proprio shape for model: {proprio.shape}", flush=True)
-            
-            return_dict["proprio"] = proprio
-            debug_proprio_structure(proprio)
+            proprio_tensor = torch.tensor(proprio_processed, dtype=torch.float32).unsqueeze(0)
+            print(f"[DEBUG] Final proprio shape for model: {proprio_tensor.shape}", flush=True)
+            return_dict["proprio"] = proprio_tensor
+
+        print(f"[DEBUG TOKENS] Input IDs length: {len(input_ids)}", flush=True)
+        print(f"[DEBUG TOKENS] Action chunk string length: {len(action_chunk_string)}", flush=True)
+        print(f"[DEBUG TOKENS] Action chunk tokens: {action_chunk_string}", flush=True)
         return return_dict
 
 class RLDSDataset(IterableDataset):
