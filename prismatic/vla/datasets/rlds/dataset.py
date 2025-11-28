@@ -520,20 +520,29 @@ def custom_decode_and_resize(obs, resize_size=None):
     if resize_size is None:
         resize_size = {}
     
+    print(f"[DEBUG CUSTOM DECODE] Input obs keys: {list(obs.keys())}", flush=True)
+    
     # Handle different image keys
     image_keys = ["image_primary", "image_wrist"]
     
     for key in image_keys:
         if key in obs and obs[key] is not None:
+            print(f"[DEBUG CUSTOM DECODE] Processing {key}, type: {type(obs[key])}", flush=True)
+            
             # Decode the image from bytes
             image = tf.io.decode_image(obs[key], channels=3, expand_animations=False)
             
             # Ensure the image has the right dtype and shape
             image = tf.cast(image, tf.float32) / 255.0
             
+            print(f"[DEBUG CUSTOM DECODE] {key} decoded shape: {image.shape}", flush=True)
+            
             # Resize if specified for this key
             if key in resize_size:
-                image = tf.image.resize(image, resize_size[key], method="lanczos3", antialias=True)
+                target_size = resize_size[key]
+                print(f"[DEBUG CUSTOM DECODE] Resizing {key} to {target_size}", flush=True)
+                image = tf.image.resize(image, target_size, method="lanczos3", antialias=True)
+                print(f"[DEBUG CUSTOM DECODE] {key} resized shape: {image.shape}", flush=True)
             
             obs[key] = image
     
@@ -542,7 +551,7 @@ def custom_decode_and_resize(obs, resize_size=None):
 def apply_frame_transforms(dataset, resize_size=(224, 224), num_parallel_calls=None, train=True):
     """Apply frame-level transforms to the dataset."""
     
-    # Convert resize_size to dict format if it's a tuple
+    # Convert resize_size to dict format
     if isinstance(resize_size, tuple):
         resize_size_dict = {
             "image_primary": resize_size,
@@ -551,19 +560,25 @@ def apply_frame_transforms(dataset, resize_size=(224, 224), num_parallel_calls=N
     else:
         resize_size_dict = resize_size
     
-    def apply_obs_only(frame, fn):
-        frame["observation"] = fn(frame["observation"])
+    print(f"[DEBUG FRAME TRANSFORMS] resize_size_dict: {resize_size_dict}", flush=True)
+    
+    def frame_transform_fn(frame):
+        """Transform function for each frame"""
+        print(f"[DEBUG FRAME TRANSFORM] Frame keys: {list(frame.keys())}", flush=True)
+        
+        # Apply the custom decode and resize to observation
+        frame["observation"] = custom_decode_and_resize(frame["observation"], resize_size_dict)
+        
         return frame
     
-    # Use your custom decode function
-    decode_fn = lambda obs: custom_decode_and_resize(obs, resize_size_dict)
-    
+    # Apply the transforms
     dataset = dataset.frame_map(
-        partial(apply_obs_only, decode_fn), 
+        frame_transform_fn, 
         num_parallel_calls=num_parallel_calls
     )
     
     return dataset
+
 # def apply_frame_transforms(
 #     dataset: dl.DLataset,
 #     *,
@@ -963,8 +978,30 @@ def make_interleaved_dataset(
         dataset = dataset.map(create_debug_wrapper("AFTER_TRAJ_TRANSFORMS"))
     else:
         print("[DEBUG] Dataset does not have map method after trajectory transforms", flush=True)
-    print(f"[DEBUG] Frame transform kwargs: {frame_transform_kwargs}", flush=True)
-    print(f"[DEBUG] Train mode: {train}", flush=True)
+    # print(f"[DEBUG] Frame transform kwargs: {frame_transform_kwargs}", flush=True)
+    # print(f"[DEBUG] Train mode: {train}", flush=True)
+    
+    def debug_frame_structure(dataset):
+        """Debug the structure of frames in the dataset"""
+        def print_frame_info(frame):
+            print(f"[DEBUG FRAME STRUCTURE] Frame keys: {list(frame.keys())}", flush=True)
+            if 'observation' in frame:
+                obs = frame['observation']
+                print(f"[DEBUG FRAME STRUCTURE] Observation keys: {list(obs.keys())}", flush=True)
+                for key, value in obs.items():
+                    if hasattr(value, 'shape'):
+                        print(f"[DEBUG FRAME STRUCTURE] {key} shape: {value.shape}", flush=True)
+                    elif hasattr(value, 'dtype'):
+                        print(f"[DEBUG FRAME STRUCTURE] {key} dtype: {value.dtype}", flush=True)
+                    else:
+                        print(f"[DEBUG FRAME STRUCTURE] {key} type: {type(value)}", flush=True)
+            return frame
+        
+        return dataset.frame_map(print_frame_info)
+
+    # Use it before applying transforms
+    dataset = debug_frame_structure(dataset)
+    
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
     # [Contract] When training VLA Policies, we let the Collator handle Batching!
     if batch_size is not None:
