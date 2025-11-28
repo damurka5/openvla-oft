@@ -33,10 +33,74 @@ class RLDSBatchTransform:
     use_wrist_image: bool = False
     use_proprio: bool = False
 
+#     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
+#         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
+#         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
+#         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+#         lang = rlds_batch["task"]["language_instruction"].decode().lower()
+#         actions = rlds_batch["action"]
+
+#         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
+#         prompt_builder = self.prompt_builder_fn("openvla")
+
+#         # Get future action chunk
+#         future_actions = rlds_batch["action"][1:]
+#         future_actions_string = ''.join(self.action_tokenizer(future_actions))
+
+#         # Get action chunk string
+#         current_action_string = self.action_tokenizer(current_action)
+#         action_chunk_string = current_action_string + future_actions_string
+#         action_chunk_len = len(action_chunk_string)
+
+#         conversation = [
+#             {"from": "human", "value": f"What action should the robot take to {lang}?"},
+#             {"from": "gpt", "value": action_chunk_string},
+#         ]
+#         for turn in conversation:
+#             prompt_builder.add_turn(turn["from"], turn["value"])
+
+#         # Tokenize (w/ `base_tokenizer`)
+#         input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
+#         labels = list(input_ids)
+
+#         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
+#         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
+#         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
+#         pixel_values = self.image_transform(img)
+
+#         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
+#         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
+#         if not self.predict_stop_token:
+#             labels[-1] = IGNORE_INDEX
+
+#         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+
+#         # Add additional inputs
+#         if self.use_wrist_image:
+#             all_wrist_pixels = []
+#             for k in rlds_batch["observation"].keys():
+#                 if "wrist" in k:
+#                     img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
+#                     pixel_values_wrist = self.image_transform(img_wrist)
+#                     all_wrist_pixels.append(pixel_values_wrist)
+#             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+#         if self.use_proprio and "proprio" in rlds_batch["observation"]:
+#             proprio = rlds_batch["observation"]["proprio"]
+#             return_dict["proprio"] = proprio
+
+#         return return_dict
+
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        
+        # FIX: Convert float32 images to uint8 for PIL
+        image_primary_data = rlds_batch["observation"]["image_primary"][0]
+        if image_primary_data.dtype == np.float32:
+            # Convert from float32 [0,1] to uint8 [0,255]
+            image_primary_data = (image_primary_data * 255).astype(np.uint8)
+        img = Image.fromarray(image_primary_data)
+        
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
 
@@ -75,21 +139,24 @@ class RLDSBatchTransform:
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
 
-        # Add additional inputs
+        # Add additional inputs - FIX wrist images too
         if self.use_wrist_image:
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
                 if "wrist" in k:
-                    img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
+                    wrist_image_data = rlds_batch["observation"][k][0]
+                    if wrist_image_data.dtype == np.float32:
+                        wrist_image_data = (wrist_image_data * 255).astype(np.uint8)
+                    img_wrist = Image.fromarray(wrist_image_data)
                     pixel_values_wrist = self.image_transform(img_wrist)
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+        
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
 
         return return_dict
-
 
 class RLDSDataset(IterableDataset):
     def __init__(
