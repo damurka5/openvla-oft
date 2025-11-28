@@ -23,6 +23,15 @@ from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYP
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 
+def debug_actions(actions):
+    print(f"[DEBUG ACTIONS] Type: {type(actions)}", flush=True)
+    if hasattr(actions, 'shape'):
+        print(f"[DEBUG ACTIONS] Shape: {actions.shape}", flush=True)
+    if hasattr(actions, 'dtype'):
+        print(f"[DEBUG ACTIONS] Dtype: {actions.dtype}", flush=True)
+    print(f"[DEBUG ACTIONS] Sample values: {actions[:2] if len(actions) > 2 else actions}", flush=True)
+    return actions
+
 @dataclass
 class RLDSBatchTransform:
     action_tokenizer: ActionTokenizer
@@ -100,46 +109,46 @@ class RLDSBatchTransform:
             image_primary_data = (image_primary_data * 255).astype(np.uint8)
         img = Image.fromarray(image_primary_data)
         
-        # FIX: Robust language instruction handling
+        # FIX: Handle language instruction (could be bytes or already decoded)
         lang_instruction = rlds_batch["task"]["language_instruction"]
-        print(f"[DEBUG] Language instruction type: {type(lang_instruction)}, value: {lang_instruction}", flush=True)
-        
-        try:
-            if hasattr(lang_instruction, 'decode'):
-                # It's bytes
-                lang = lang_instruction.decode().lower()
-            elif isinstance(lang_instruction, np.ndarray):
-                # It's a numpy array - could be array of bytes or strings
-                if lang_instruction.dtype == np.object_ or lang_instruction.dtype.type is np.str_:
-                    # Array of strings
-                    lang = str(lang_instruction[0]).lower()
-                else:
-                    # Array of bytes
-                    lang = lang_instruction[0].decode().lower()
-            elif isinstance(lang_instruction, (str, bytes)):
-                # Direct string or bytes
-                if isinstance(lang_instruction, bytes):
-                    lang = lang_instruction.decode().lower()
-                else:
-                    lang = lang_instruction.lower()
-            else:
-                # Fallback - try to convert to string
-                lang = str(lang_instruction).lower()
-        except Exception as e:
-            print(f"[ERROR] Failed to decode language instruction: {e}", flush=True)
-            lang = "perform the task"  # Default fallback
-        
-        print(f"[DEBUG] Final language: {lang}", flush=True)
+        if hasattr(lang_instruction, 'decode'):
+            lang = lang_instruction.decode().lower()
+        else:
+            # It's a numpy array of bytes - take the first element and decode
+            lang = lang_instruction[0].decode().lower() if isinstance(lang_instruction, np.ndarray) else str(lang_instruction).lower()
         
         actions = rlds_batch["action"]
+        
+        print(f"[DEBUG] Actions shape: {actions.shape}, dtype: {actions.dtype}", flush=True)
+        print(f"[DEBUG] Current action: {current_action}, type: {type(current_action)}", flush=True)
 
-        # Rest of your existing code...
+        # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
 
+        # Get future action chunk - FIX: Ensure we're passing the right data type
         future_actions = rlds_batch["action"][1:]
-        future_actions_string = ''.join(self.action_tokenizer(future_actions))
+        print(f"[DEBUG] Future actions shape: {future_actions.shape}", flush=True)
+        
+        # FIX: Convert actions to the right format for the tokenizer
+        try:
+            future_actions_string = ''.join(self.action_tokenizer(future_actions))
+        except Exception as e:
+            print(f"[ERROR] Action tokenizer failed: {e}", flush=True)
+            print(f"[DEBUG] Future actions type: {type(future_actions)}, dtype: {future_actions.dtype}", flush=True)
+            # Try converting to the right format
+            if isinstance(future_actions, np.ndarray):
+                future_actions = future_actions.astype(np.float32)
+            future_actions_string = ''.join(self.action_tokenizer(future_actions))
 
-        current_action_string = self.action_tokenizer(current_action)
+        # Get action chunk string - FIX: Handle current action properly
+        try:
+            current_action_string = self.action_tokenizer(current_action)
+        except Exception as e:
+            print(f"[ERROR] Current action tokenizer failed: {e}", flush=True)
+            if isinstance(current_action, np.ndarray):
+                current_action = current_action.astype(np.float32)
+            current_action_string = self.action_tokenizer(current_action)
+        
         action_chunk_string = current_action_string + future_actions_string
         action_chunk_len = len(action_chunk_string)
 
@@ -150,19 +159,23 @@ class RLDSBatchTransform:
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
 
+        # Tokenize (w/ `base_tokenizer`)
         input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
         labels = list(input_ids)
 
+        # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
+        #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
 
+        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
 
-        # FIX: Apply the same conversion to wrist images
+        # Add additional inputs - FIX wrist images too
         if self.use_wrist_image:
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
@@ -178,6 +191,10 @@ class RLDSBatchTransform:
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
+            
+        debug_actions(rlds_batch["action"])
+        debug_actions(current_action)
+        debug_actions(future_actions)
 
         return return_dict
 
