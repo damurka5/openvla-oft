@@ -897,15 +897,30 @@ def finetune(cfg: FinetuneConfig) -> None:
     #         {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
     #         to_bf16=True,
     #     )
-    print(
-        "[DEBUG] llm_dim attr:", getattr(vla.module, "llm_dim", None),
-        "| language_model.hidden_size:", vla.module.language_model.config.hidden_size,
-        flush=True,
-    )
-
+    # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
-        # ✅ Use the actual transformer hidden size
-        transformer_hidden_dim = vla.module.language_model.config.hidden_size
+        # This must match how we build action chunks in RLDSBatchTransform:
+        # we use 1 current + max_future_actions future actions.
+        max_future_actions = 10  # MUST match RLDSBatchTransform in datasets.py
+        chunk_len = 1 + max_future_actions  # 11 in your logs
+
+        # actions_hidden_states comes in with shape:
+        # (batch_size, chunk_len * ACTION_DIM, llm_dim)
+        # Then we reshape to (batch_size, NUM_ACTIONS_CHUNK, -1),
+        # so the flattened per-chunk dim is:
+        #   flattened_dim = chunk_len * ACTION_DIM * llm_dim / NUM_ACTIONS_CHUNK
+        llm_dim = vla.module.llm_dim
+        flattened_dim = (chunk_len * ACTION_DIM * llm_dim) // NUM_ACTIONS_CHUNK
+
+        # L1RegressionActionHead expects input_dim * ACTION_DIM = flattened_dim
+        input_dim_for_head = flattened_dim // ACTION_DIM  # 5632 in your current setup
+
+        print(
+            f"[DEBUG ACTION_HEAD INIT] llm_dim={llm_dim}, ACTION_DIM={ACTION_DIM}, "
+            f"chunk_len={chunk_len}, NUM_ACTIONS_CHUNK={NUM_ACTIONS_CHUNK}, "
+            f"flattened_dim={flattened_dim}, input_dim_for_head={input_dim_for_head}",
+            flush=True,
+        )
 
         action_head = init_module(
             L1RegressionActionHead,
@@ -913,13 +928,12 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {
-                "input_dim": transformer_hidden_dim,
-                "hidden_dim": transformer_hidden_dim,
-                "action_dim": ACTION_DIM,  # 5 in your case
+                "input_dim": input_dim_for_head,   # 5632 for your current config
+                "hidden_dim": llm_dim,             # internal MLP hidden size
+                "action_dim": ACTION_DIM,          # 5-DoF
             },
             to_bf16=True,
         )
-
 
     # If applicable, instantiate diffusion action head and noisy action projector
     if cfg.use_diffusion:

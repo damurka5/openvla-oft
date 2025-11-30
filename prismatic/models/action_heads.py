@@ -81,91 +81,28 @@ class MLPResNet(nn.Module):
         return x
 
 
-# class L1RegressionActionHead(nn.Module):
-#     """Simple MLP-based action head that generates continuous actions via L1 regression."""
-#     def __init__(
-#         self,
-#         input_dim=4096,
-#         hidden_dim=4096,
-#         action_dim=7,
-#     ):
-#         super().__init__()
-#         self.action_dim = action_dim
-#         self.model = MLPResNet(
-#             num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
-#         )
-
-#     def predict_action(self, actions_hidden_states):
-#         # actions_hidden_states: last hidden states of Transformer corresponding to action tokens in sequence
-#         # - shape: (batch_size, chunk_len * action_dim, hidden_dim)
-#         # ground_truth_actions: ground-truth actions
-#         # - shape: (batch_size, chunk_len, action_dim)
-#         batch_size = actions_hidden_states.shape[0]
-#         device = actions_hidden_states.device
-#         rearranged_actions_hidden_states = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
-#         action = self.model(rearranged_actions_hidden_states)
-#         return action
-
 class L1RegressionActionHead(nn.Module):
-    """Simple MLP-based action head that generates continuous actions via L1 regression.
-
-    NOTE: We build the underlying MLP lazily based on the *actual* flattened feature
-    dimension we see at runtime. This avoids shape mismatches when the action-token
-    layout changes (e.g., 5-DoF vs 7-DoF robots, different tokenization settings, etc.).
-    """
+    """Simple MLP-based action head that generates continuous actions via L1 regression."""
     def __init__(
         self,
-        input_dim=4096,   # ignored for now; kept for backwards-compatible signature
+        input_dim=4096,
         hidden_dim=4096,
         action_dim=7,
     ):
         super().__init__()
         self.action_dim = action_dim
-        self.hidden_dim = hidden_dim
-        self.model = None           # will be created on first forward
-        self._input_dim = None      # flattened feature dim used to build the MLP
-
-    def _build_model(self, flattened_dim: int, device, dtype):
-        """Build the MLPResNet once we know the true input dim."""
-        self._input_dim = flattened_dim
         self.model = MLPResNet(
-            num_blocks=2,
-            input_dim=flattened_dim,        # <-- use the actual flattened dim directly
-            hidden_dim=self.hidden_dim,
-            output_dim=self.action_dim,
-        ).to(device=device, dtype=dtype)
-
-        print(
-            f"[DEBUG ACTION_HEAD] Built MLPResNet with input_dim={flattened_dim}, "
-            f"hidden_dim={self.hidden_dim}, action_dim={self.action_dim}",
-            flush=True,
+            num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
         )
 
     def predict_action(self, actions_hidden_states):
         # actions_hidden_states: last hidden states of Transformer corresponding to action tokens in sequence
-        # - shape: (batch_size, chunk_len * action_dim_tokens, hidden_dim_eff)
+        # - shape: (batch_size, chunk_len * action_dim, hidden_dim)
+        # ground_truth_actions: ground-truth actions
+        # - shape: (batch_size, chunk_len, action_dim)
         batch_size = actions_hidden_states.shape[0]
         device = actions_hidden_states.device
-        dtype = actions_hidden_states.dtype
-
-        # Group into NUM_ACTIONS_CHUNK chunks and flatten everything else
-        rearranged_actions_hidden_states = actions_hidden_states.reshape(
-            batch_size, NUM_ACTIONS_CHUNK, -1
-        )  # shape: (batch_size, NUM_ACTIONS_CHUNK, flattened_dim)
-
-        flattened_dim = rearranged_actions_hidden_states.shape[-1]
-
-        # Lazily build the MLP on first use
-        if self.model is None:
-            self._build_model(flattened_dim, device, dtype)
-        else:
-            # Sanity check: make sure the feature dim hasn't silently changed
-            expected = self.model.layer_norm1.normalized_shape[0]
-            if expected != flattened_dim:
-                raise RuntimeError(
-                    f"Action head feature dim mismatch: got {flattened_dim}, expected {expected}"
-                )
-
+        rearranged_actions_hidden_states = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
         action = self.model(rearranged_actions_hidden_states)
         return action
 
