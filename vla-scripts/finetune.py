@@ -899,7 +899,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     #     )
     if cfg.use_l1_regression:
         # Get the actual transformer hidden dimension from the backbone
-        transformer_hidden_dim = vla.module.language_backbone.config.hidden_size  # adapt name if needed
+        transformer_hidden_dim = vla.module.llm.config.hidden_size#vla.module.language_backbone.config.hidden_size  # adapt name if needed
 
         action_head = init_module(
             L1RegressionActionHead,
