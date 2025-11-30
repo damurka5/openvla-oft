@@ -887,16 +887,33 @@ def finetune(cfg: FinetuneConfig) -> None:
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
         )
 
-    # If applicable, instantiate continuous action head for L1 regression
+    # # If applicable, instantiate continuous action head for L1 regression
+    # if cfg.use_l1_regression:
+    #     action_head = init_module(
+    #         L1RegressionActionHead,
+    #         "action_head",
+    #         cfg,
+    #         device_id,
+    #         {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+    #         to_bf16=True,
+    #     )
     if cfg.use_l1_regression:
+        # Get the actual transformer hidden dimension from the backbone
+        transformer_hidden_dim = vla.module.language_backbone.config.hidden_size  # adapt name if needed
+
         action_head = init_module(
             L1RegressionActionHead,
             "action_head",
             cfg,
             device_id,
-            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+            {
+                "input_dim": transformer_hidden_dim,   # 5632 in your case
+                "hidden_dim": transformer_hidden_dim, # you can choose another, but this is simple
+                "action_dim": ACTION_DIM,             # should be 5 for your robot
+            },
             to_bf16=True,
         )
+
 
     # If applicable, instantiate diffusion action head and noisy action projector
     if cfg.use_diffusion:
