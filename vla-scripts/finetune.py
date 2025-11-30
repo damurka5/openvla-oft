@@ -432,7 +432,28 @@ def run_forward_pass(
             ground_truth_next_actions = ground_truth_actions[:, 1:]
             predicted_next_actions = predicted_actions[:, 1:]
             curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
-            next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
+            # next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
+            # Ensure ground_truth_next_actions and predicted_next_actions have the same shape
+            # predicted_next_actions should be (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
+            # ground_truth_next_actions is currently (B, T, NUM_ACTIONS_CHUNK, ACTION_DIM)
+
+            # If ground truth has a time dimension, select a single reference timestep (e.g. the first one)
+            if ground_truth_next_actions.dim() == 4:
+                # shape: (B, T, NUM_ACTIONS_CHUNK, ACTION_DIM)
+                # take t = 0; you can change this later if you want a different alignment
+                ground_truth_next_actions = ground_truth_next_actions[:, 0]  # -> (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
+
+            # If predicted has an extra time dimension for some reason, also squeeze it
+            if predicted_next_actions.dim() == 4:
+                predicted_next_actions = predicted_next_actions[:, 0]
+
+            # Final sanity check
+            assert ground_truth_next_actions.shape == predicted_next_actions.shape, \
+                f"GT next-actions shape {ground_truth_next_actions.shape} != predicted {predicted_next_actions.shape}"
+
+            # L1 loss: use predicted as input, GT as target (normal ordering)
+            next_actions_l1_loss = torch.nn.L1Loss()(predicted_next_actions, ground_truth_next_actions)
+
             metrics.update(
                 {
                     "curr_action_l1_loss": curr_action_l1_loss.item(),
