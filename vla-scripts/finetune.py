@@ -897,9 +897,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     #         {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
     #         to_bf16=True,
     #     )
+    print(
+        "[DEBUG] llm_dim attr:", getattr(vla.module, "llm_dim", None),
+        "| language_model.hidden_size:", vla.module.language_model.config.hidden_size,
+        flush=True,
+    )
+
     if cfg.use_l1_regression:
-        # Get the actual transformer hidden dimension from the backbone
-        transformer_hidden_dim = vla.module.llm.config.hidden_size#vla.module.language_backbone.config.hidden_size  # adapt name if needed
+        # ✅ Use the actual transformer hidden size
+        transformer_hidden_dim = vla.module.language_model.config.hidden_size
 
         action_head = init_module(
             L1RegressionActionHead,
@@ -907,9 +913,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {
-                "input_dim": transformer_hidden_dim,   # 5632 in your case
-                "hidden_dim": transformer_hidden_dim, # you can choose another, but this is simple
-                "action_dim": ACTION_DIM,             # should be 5 for your robot
+                "input_dim": transformer_hidden_dim,
+                "hidden_dim": transformer_hidden_dim,
+                "action_dim": ACTION_DIM,  # 5 in your case
             },
             to_bf16=True,
         )
