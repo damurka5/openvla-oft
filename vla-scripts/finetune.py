@@ -433,25 +433,31 @@ def run_forward_pass(
             predicted_next_actions = predicted_actions[:, 1:]
             curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
             # next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
-            # Ensure ground_truth_next_actions and predicted_next_actions have the same shape
-            # predicted_next_actions should be (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
-            # ground_truth_next_actions is currently (B, T, NUM_ACTIONS_CHUNK, ACTION_DIM)
+            # --- L1 loss for next actions ---------------------------------
+            # predicted_next_actions: (B, N_pred, ACTION_DIM)
+            # ground_truth_next_actions: currently (B, T, N_gt, ACTION_DIM) or (B, N_gt, ACTION_DIM)
 
-            # If ground truth has a time dimension, select a single reference timestep (e.g. the first one)
+            # 1) If GT has a time dimension, take t=0
             if ground_truth_next_actions.dim() == 4:
-                # shape: (B, T, NUM_ACTIONS_CHUNK, ACTION_DIM)
-                # take t = 0; you can change this later if you want a different alignment
-                ground_truth_next_actions = ground_truth_next_actions[:, 0]  # -> (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
+                # (B, T, N_gt, A) -> (B, N_gt, A), take first timestep
+                ground_truth_next_actions = ground_truth_next_actions[:, 0]
 
-            # If predicted has an extra time dimension for some reason, also squeeze it
-            if predicted_next_actions.dim() == 4:
-                predicted_next_actions = predicted_next_actions[:, 0]
+            # 2) Align chunk dimension:
+            # In your logs: GT is (1, 8, 5), predicted is (1, 7, 5).
+            # Typically: chunk[0] is current, chunks[1:] are "next" actions.
+            if ground_truth_next_actions.shape[1] == predicted_next_actions.shape[1] + 1:
+                # Drop the "current" chunk from GT so we only compare future actions
+                ground_truth_next_actions = ground_truth_next_actions[:, 1:]
 
-            # Final sanity check
+            # 3) If predicted somehow has the extra chunk, drop it there instead
+            elif predicted_next_actions.shape[1] == ground_truth_next_actions.shape[1] + 1:
+                predicted_next_actions = predicted_next_actions[:, 1:]
+
+            # 4) Final sanity check
             assert ground_truth_next_actions.shape == predicted_next_actions.shape, \
                 f"GT next-actions shape {ground_truth_next_actions.shape} != predicted {predicted_next_actions.shape}"
 
-            # L1 loss: use predicted as input, GT as target (normal ordering)
+            # 5) L1 loss: predicted vs GT
             next_actions_l1_loss = torch.nn.L1Loss()(predicted_next_actions, ground_truth_next_actions)
 
             metrics.update(
