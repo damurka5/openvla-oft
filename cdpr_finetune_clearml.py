@@ -80,7 +80,7 @@ def main():
 
     # 4) Env vars
     os.environ["VLA_ROBOT"] = "CDPR"
-    os.environ["WANDB_MODE"] = "offline"
+    os.environ["WANDB_MODE"] = "online"
 
     # 5) Build torchrun command
     cmd = [
@@ -107,7 +107,9 @@ def main():
         "--max_steps",
         "100",
         "--image_aug",
-        "False",   # <-- add this
+        "False", 
+        "--wandb_entity", "damurka-innopolis-university",
+        "--wandb_project", "openvla-oft-cdpr",
     ]
     
     print(f"[CDPR] CWD: {os.getcwd()}", flush=True)
