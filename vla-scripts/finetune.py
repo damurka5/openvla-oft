@@ -1211,12 +1211,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save VLA (PEFT-wrapped) weights
-    vla_ckpt_path = ckpt_dir / "vla_cdpr_finetuned.pt"
-    print(f"[SAVE] Saving VLA weights to {vla_ckpt_path}", flush=True)
-    torch.save(vla.module.state_dict(), vla_ckpt_path)
+    # 1) Save only the PEFT/OFT adapters, not the full 7B backbone
+    vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
+    print(f"[SAVE] Saving VLA adapters to {vla_adapter_dir}", flush=True)
+    vla.module.save_pretrained(vla_adapter_dir)  # <-- key line
 
-    # Save action head weights if using L1 regression
+    # 2) Save action head weights (this is small, so torch.save is fine)
     if cfg.use_l1_regression:
         ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
         print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
