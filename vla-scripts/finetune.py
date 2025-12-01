@@ -1203,6 +1203,21 @@ def finetune(cfg: FinetuneConfig) -> None:
             if log_step == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+    
+    # Build checkpoint directory: e.g. VLA_CDPR/oft_cdpr_ckpts/<run_name>/
+    ckpt_dir = Path(cfg.run_root_dir) / cfg.run_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save VLA (PEFT-wrapped) weights
+    vla_ckpt_path = ckpt_dir / "vla_cdpr_finetuned.pt"
+    print(f"[SAVE] Saving VLA weights to {vla_ckpt_path}", flush=True)
+    torch.save(vla.module.state_dict(), vla_ckpt_path)
+
+    # Save action head weights
+    if cfg.use_l1_regression:
+        ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
+        print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
+        torch.save(action_head.module.state_dict(), ah_ckpt_path)
 
 
 if __name__ == "__main__":

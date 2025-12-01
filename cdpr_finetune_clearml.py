@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 from clearml import Task, Dataset
+from pathlib import Path
 
 PROJECT = "CDPR"
 TASK_NAME = "openvla-7b-oft-cdpr"
@@ -111,7 +112,21 @@ def main():
 
 
     print("Running command:", " ".join(cmd), flush=True)
-    return subprocess.call(cmd)
+    ret = subprocess.call(cmd)
+
+    # === NEW: upload the finetuned checkpoint folder as an artifact ===
+    # This assumes finetune.py saved things under ./VLA_CDPR/oft_cdpr_ckpts
+    ckpt_root = Path("/root/repo/openvla-oft") / "VLA_CDPR" / "oft_cdpr_ckpts"
+    if ckpt_root.exists():
+        print(f"[CDPR] Uploading checkpoint folder as ClearML artifact: {ckpt_root}", flush=True)
+        task.upload_artifact(
+            name="openvla_cdpr_finetuned",
+            artifact_object=str(ckpt_root),
+        )
+    else:
+        print(f"[CDPR] WARNING: checkpoint root not found: {ckpt_root}", flush=True)
+
+    return ret
 
 
 if __name__ == "__main__":
