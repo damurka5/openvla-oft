@@ -109,14 +109,19 @@ def main():
         "--image_aug",
         "False",   # <-- add this
     ]
+    
+    print(f"[CDPR] CWD: {os.getcwd()}", flush=True)
+    print(f"[CDPR] Script dir: {Path(__file__).resolve().parent}", flush=True)
 
 
     print("Running command:", " ".join(cmd), flush=True)
     ret = subprocess.call(cmd)
 
     # === NEW: upload the finetuned checkpoint folder as an artifact ===
-    # This assumes finetune.py saved things under ./VLA_CDPR/oft_cdpr_ckpts
-    ckpt_root = Path("/root/repo/openvla-oft") / "VLA_CDPR" / "oft_cdpr_ckpts"
+    # Use the repo root where THIS script lives
+    repo_root = Path(__file__).resolve().parent      # cdpr_finetune_clearml.py is in repo root
+    ckpt_root = repo_root / "VLA_CDPR" / "oft_cdpr_ckpts"
+
     if ckpt_root.exists():
         print(f"[CDPR] Uploading checkpoint folder as ClearML artifact: {ckpt_root}", flush=True)
         task.upload_artifact(
