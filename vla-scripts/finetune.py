@@ -819,6 +819,21 @@ def finetune(cfg: FinetuneConfig) -> None:
     torch.cuda.set_device(device_id)
     torch.cuda.empty_cache()
 
+    if distributed_state.is_main_process:
+        api_key_present = "WANDB_API_KEY" in os.environ and bool(os.environ["WANDB_API_KEY"])
+        print(f"[DEBUG] WANDB_API_KEY present: {api_key_present}", flush=True)
+
+        if not api_key_present:
+            # If no key, force offline to avoid interactive prompt
+            os.environ["WANDB_MODE"] = "offline"
+            print("[DEBUG] WANDB_API_KEY missing, switching to WANDB_MODE=offline", flush=True)
+
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=cfg.wandb_project,
+            name=f"ft+{run_id}",
+        )
+    
     # Initialize wandb logging
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
