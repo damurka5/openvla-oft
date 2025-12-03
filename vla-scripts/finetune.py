@@ -592,6 +592,11 @@ def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
     Returns:
         None.
     """
+    if hasattr(wandb_entity, '__class__') and wandb_entity.__class__.__name__ == 'DummyWandb':
+        # Just print metrics instead
+        print(f"[Step {step}] {prefix} metrics: {metrics}", flush=True)
+        return
+    
     log_dict = {}
     for name, value in metrics.items():
         # Map loss_value to Loss for better readability in W&B
@@ -851,8 +856,25 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
     
     # Initialize wandb logging
+    # if distributed_state.is_main_process:
+    #     wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+        # Check if wandb should be disabled
+        if os.environ.get("WANDB_DISABLED", "false").lower() != "true":
+            wandb.init(
+                entity=cfg.wandb_entity,
+                project=cfg.wandb_project,
+                name=f"ft+{run_id}",
+            )
+        else:
+            print("[WANDB DISABLED] Skipping wandb initialization", flush=True)
+            # Create a dummy wandb object
+            class DummyWandb:
+                def log(self, *args, **kwargs):
+                    pass
+                def finish(self, *args, **kwargs):
+                    pass
+            wandb = DummyWandb()
 
     # Print detected constants
     print(

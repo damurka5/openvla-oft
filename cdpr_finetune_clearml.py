@@ -45,11 +45,8 @@ def find_tfrecord_dir(dataset_root: str) -> str:
 
 
 def main():
-    # 1) Init ClearML task with TensorBoard support
+    # 1) Init ClearML task
     task = Task.init(project_name=PROJECT, task_name=TASK_NAME)
-    
-    # Enable TensorBoard auto-logging
-    task.connect_configuration({})
     
     # 2) Get dataset from ClearML
     ds = Dataset.get(dataset_name="cdpr_synth_v1", dataset_project=PROJECT)
@@ -85,6 +82,10 @@ def main():
     os.environ["VLA_ROBOT"] = "CDPR"
     os.environ["WANDB_DISABLED"] = "true"
     os.environ["WANDB_MODE"] = "offline"
+    
+    # Also set to prevent interactive prompt
+    os.environ["WANDB_API_KEY"] = "dummy_key_to_prevent_prompt"
+    os.environ["WANDB_SILENT"] = "true"
 
     # 5) Build torchrun command with TensorBoard setup
     cmd = [
@@ -112,23 +113,26 @@ def main():
         "100",
         "--image_aug",
         "False",
-        # Disable WandB
-        "--use_wandb", "False",
-        # Optional: Give a fixed run ID for easier tracking
-        "--run_id_override", "cdpr_clearml_run",
-        # Optional: Change wandb entity/project to dummy values
+        # Disable WandB - but the script doesn't have this argument!
+        # Let's check what arguments finetune.py actually accepts
+    ]
+    
+    # First, let's see what arguments finetune.py accepts
+    # Looking at the code, it uses draccus.wrap() which means all FinetuneConfig fields
+    # are available as command line arguments
+    
+    # Add arguments to disable wandb (based on FinetuneConfig in the script)
+    cmd.extend([
         "--wandb_entity", "dummy",
         "--wandb_project", "dummy",
-    ]
+        # The script doesn't have use_wandb argument, so we need to prevent wandb.init()
+        # by setting environment variables instead
+    ])
     
     print(f"[CDPR] CWD: {os.getcwd()}", flush=True)
     print(f"[CDPR] Script dir: {Path(__file__).resolve().parent}", flush=True)
 
     print("Running command:", " ".join(cmd), flush=True)
-    
-    # Tell ClearML where to look for TensorBoard logs
-    tensorboard_log_dir = "./VLA_CDPR/oft_cdpr_ckpts"
-    task.connect_tensorboard(tensorboard_log_dir)
     
     # Run training
     ret = subprocess.call(cmd)
@@ -144,9 +148,7 @@ def main():
             artifact_object=str(ckpt_root),
         )
         
-        # Also manually upload any TensorBoard event files
-        for event_file in ckpt_root.glob("**/events.out.tfevents.*"):
-            print(f"[CDPR] Found TensorBoard event file: {event_file}", flush=True)
+        # ClearML automatically logs console output, no need for special TensorBoard setup
     else:
         print(f"[CDPR] WARNING: checkpoint root not found: {ckpt_root}", flush=True)
 
