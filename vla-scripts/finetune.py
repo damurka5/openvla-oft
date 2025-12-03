@@ -818,6 +818,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
+    import wandb
+    
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
@@ -844,16 +846,47 @@ def finetune(cfg: FinetuneConfig) -> None:
         api_key_present = "WANDB_API_KEY" in os.environ and bool(os.environ["WANDB_API_KEY"])
         print(f"[DEBUG] WANDB_API_KEY present: {api_key_present}", flush=True)
 
-        if not api_key_present:
-            # If no key, force offline to avoid interactive prompt
-            os.environ["WANDB_MODE"] = "offline"
-            print("[DEBUG] WANDB_API_KEY missing, switching to WANDB_MODE=offline", flush=True)
+        # Check if we should disable wandb
+        disable_wandb = os.environ.get("WANDB_DISABLED", "false").lower() == "true"
+        
+        if disable_wandb:
+            print("[DEBUG] WandB disabled via WANDB_DISABLED environment variable", flush=True)
+            # Create a dummy wandb object
+            class DummyWandb:
+                def init(self, *args, **kwargs):
+                    print("[WANDB] Skipped initialization (disabled)", flush=True)
+                    return self
+                def log(self, *args, **kwargs):
+                    pass
+                def finish(self, *args, **kwargs):
+                    pass
+                def __getattr__(self, name):
+                    return lambda *args, **kwargs: None
+            
+            wandb = DummyWandb()
+            wandb.init()  # Initialize dummy
+        else:
+            if not api_key_present:
+                # If no key, force offline to avoid interactive prompt
+                os.environ["WANDB_MODE"] = "offline"
+                print("[DEBUG] WANDB_API_KEY missing, switching to WANDB_MODE=offline", flush=True)
 
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=cfg.wandb_project,
-            name=f"ft+{run_id}",
-        )
+            wandb.init(
+                entity=cfg.wandb_entity,
+                project=cfg.wandb_project,
+                name=f"ft+{run_id}",
+            )
+    else:
+        # For non-main processes, create a dummy wandb
+        class DummyWandb:
+            def log(self, *args, **kwargs):
+                pass
+            def finish(self, *args, **kwargs):
+                pass
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+        
+        wandb = DummyWandb()
     
     # Initialize wandb logging
     # if distributed_state.is_main_process:
