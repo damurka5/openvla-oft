@@ -62,6 +62,7 @@ from prismatic.vla.constants import (
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from clearml import Task
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -859,6 +860,34 @@ def log_metrics_to_tensorboard(metrics, prefix, step, tb_writer) -> None:
             console_items.append(f"{name.replace('_', ' ').title()}: {value:.4f}")
     console_str += ", ".join(console_items)
     print(console_str, flush=True)
+    
+def log_metrics_to_tensorboard_and_clearml(metrics, prefix, step, tb_writer=None, clr_logger=None):
+    for name, value in metrics.items():
+        tag = "Loss" if name == "loss_value" else name.replace("_", " ").title()
+
+        # TensorBoard
+        if tb_writer is not None:
+            tb_writer.add_scalar(f"{prefix}/{tag}", value, step)
+
+        # ClearML explicit logging
+        if clr_logger is not None:
+            clr_logger.report_scalar(
+                title=prefix,
+                series=tag,
+                value=float(value),
+                iteration=step,
+            )
+
+    if tb_writer is not None:
+        tb_writer.flush()
+
+    # Debug print
+    pretty = ", ".join(
+        f"{('Loss' if n == 'loss_value' else n.replace('_', ' ').title())}: {v:.4f}"
+        for n, v in metrics.items()
+    )
+    print(f"[Step {step}] {prefix}: {pretty}", flush=True)
+
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -876,7 +905,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
-    import wandb
+    task = Task.current_task()
     
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
@@ -1250,7 +1279,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if tb_writer is not None and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_tensorboard(smoothened_metrics, "VLA Train", log_step, tb_writer)
+                log_metrics_to_tensorboard_and_clearml(
+                        smoothened_metrics,
+                        "VLA Train",
+                        log_step,
+                        tb_writer=tb_writer,
+                        clr_logger=logger,
+                    )
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
