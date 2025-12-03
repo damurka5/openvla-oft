@@ -1376,15 +1376,15 @@ def finetune(cfg: FinetuneConfig) -> None:
         print("[TensorBoard] Writer closed")
 
     # 1) Save only the PEFT/OFT adapters, not the full 7B backbone
-    # vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
-    # print(f"[SAVE] Saving VLA adapters to {vla_adapter_dir}", flush=True)
-    # vla.module.save_pretrained(vla_adapter_dir)  # <-- key line
+    vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
+    print(f"[SAVE] Saving VLA adapters to {vla_adapter_dir}", flush=True)
+    vla.module.save_pretrained(vla_adapter_dir)  # <-- key line
 
-    # # 2) Save action head weights (this is small, so torch.save is fine)
-    # if cfg.use_l1_regression:
-    #     ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
-    #     print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
-    #     torch.save(action_head.module.state_dict(), ah_ckpt_path)
+    # 2) Save action head weights (this is small, so torch.save is fine)
+    if cfg.use_l1_regression:
+        ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
+        print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
+        torch.save(action_head.module.state_dict(), ah_ckpt_path)
 
 if __name__ == "__main__":
     finetune()

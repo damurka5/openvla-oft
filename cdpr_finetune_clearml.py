@@ -46,7 +46,8 @@ def find_tfrecord_dir(dataset_root: str) -> str:
 
 def main():
     # 1) Init ClearML task
-    task = Task.init(project_name=PROJECT, task_name=TASK_NAME)
+    # task = Task.init(project_name=PROJECT, task_name=TASK_NAME)
+    task = Task.current_task() or Task.init(project_name=PROJECT, task_name=TASK_NAME)
     
     # 2) Get dataset from ClearML
     ds = Dataset.get(dataset_name="cdpr_synth_v1", dataset_project=PROJECT)
@@ -110,7 +111,7 @@ def main():
         "--learning_rate",
         "1e-4",
         "--max_steps",
-        "100",
+        "1000",
         "--image_aug",
         "False",
         # Disable WandB - but the script doesn't have this argument!
