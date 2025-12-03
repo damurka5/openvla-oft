@@ -578,6 +578,39 @@ def compute_smoothened_metrics(metrics_deques) -> dict:
             smoothened_metrics[name] = sum(deque) / len(deque)
     return smoothened_metrics
 
+def log_metrics_to_wandb_and_tensorboard(metrics, prefix, step, wandb_entity, tb_writer=None) -> None:
+    """
+    Log metrics to Weights & Biases AND TensorBoard.
+    """
+    log_dict = {}
+    for name, value in metrics.items():
+        # Map loss_value to Loss for better readability
+        if name == "loss_value":
+            log_dict[f"{prefix}/Loss"] = value
+        # Keep other metrics as is
+        else:
+            log_dict[f"{prefix}/{name.replace('_', ' ').title()}"] = value
+    
+    # Log to wandb if available and not dummy
+    if wandb_entity and not hasattr(wandb_entity, '__class__') or wandb_entity.__class__.__name__ != 'DummyWandb':
+        wandb_entity.log(log_dict, step=step)
+    
+    # Log to TensorBoard if writer is available
+    if tb_writer is not None:
+        for key, val in log_dict.items():
+            tb_writer.add_scalar(key, val, step)
+        tb_writer.flush()  # Ensure data is written
+    
+    # Also print to console for debugging
+    console_str = f"[Step {step}] {prefix}: "
+    console_items = []
+    for name, value in metrics.items():
+        if name == "loss_value":
+            console_items.append(f"Loss: {value:.4f}")
+        else:
+            console_items.append(f"{name.replace('_', ' ').title()}: {value:.4f}")
+    console_str += ", ".join(console_items)
+    print(console_str, flush=True)
 
 def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
     """
@@ -1182,9 +1215,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
-    tb_log_dir = "./VLA_CDPR/oft_cdpr_ckpts"
-    if os.path.exists(tb_log_dir):
-        tb_thread = start_tensorboard(tb_log_dir)
+    # tb_log_dir = "./VLA_CDPR/oft_cdpr_ckpts"
+    # if os.path.exists(tb_log_dir):
+    #     tb_thread = start_tensorboard(tb_log_dir)
+        
+    if distributed_state.is_main_process:
+        tb_writer = SummaryWriter(log_dir=str(run_dir))
+    else:
+        tb_writer = None
         
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -1230,7 +1268,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+                # log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+                log_metrics_to_wandb_and_tensorboard(smoothened_metrics, "VLA Train", log_step, wandb, tb_writer)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
@@ -1240,14 +1279,17 @@ def finetune(cfg: FinetuneConfig) -> None:
                     param_group["lr"] = current_lr
 
             if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-                # Log the learning rate
-                # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
+                # Log the learning rate to wandb
                 wandb.log(
                     {
                         "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
                     },
                     step=log_step,
                 )
+                # Also log to TensorBoard
+                if tb_writer is not None:
+                    tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
+                    tb_writer.flush()
 
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
@@ -1300,6 +1342,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Close TensorBoard writer
+    if distributed_state.is_main_process and tb_writer is not None:
+        tb_writer.close()
 
     # 1) Save only the PEFT/OFT adapters, not the full 7B backbone
     vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
