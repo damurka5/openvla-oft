@@ -905,7 +905,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
-    task = Task.current_task()
+    clearml_task = Task.current_task() if Task is not None else None
+
+    if clearml_task is None and Task is not None:
+        clearml_task = Task.init(
+            project_name="CDPR",
+            task_name="openvla-7b-oft-cdpr-a100",
+        )
+
+    logger = clearml_task.get_logger() if clearml_task is not None else None
+
     
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
