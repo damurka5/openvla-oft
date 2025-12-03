@@ -835,6 +835,31 @@ def start_tensorboard(log_dir):
     thread.start()
     return thread
 
+def log_metrics_to_tensorboard(metrics, prefix, step, tb_writer) -> None:
+    """
+    Log metrics to TensorBoard only.
+    """
+    for name, value in metrics.items():
+        # Map loss_value to Loss for better readability
+        if name == "loss_value":
+            tb_writer.add_scalar(f"{prefix}/Loss", value, step)
+        # Keep other metrics as is
+        else:
+            tb_writer.add_scalar(f"{prefix}/{name.replace('_', ' ').title()}", value, step)
+    
+    tb_writer.flush()  # Ensure data is written
+    
+    # Print to console for debugging
+    console_str = f"[Step {step}] {prefix}: "
+    console_items = []
+    for name, value in metrics.items():
+        if name == "loss_value":
+            console_items.append(f"Loss: {value:.4f}")
+        else:
+            console_items.append(f"{name.replace('_', ' ').title()}: {value:.4f}")
+    console_str += ", ".join(console_items)
+    print(console_str, flush=True)
+
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
     """
@@ -876,42 +901,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     torch.cuda.empty_cache()
 
     if distributed_state.is_main_process:
-        api_key_present = "WANDB_API_KEY" in os.environ and bool(os.environ["WANDB_API_KEY"])
-        print(f"[DEBUG] WANDB_API_KEY present: {api_key_present}", flush=True)
-
-        # Check if we should disable wandb
-        disable_wandb = os.environ.get("WANDB_DISABLED", "false").lower() == "true"
+        # Disable wandb completely
+        os.environ["WANDB_DISABLED"] = "true"
         
-        if disable_wandb:
-            print("[DEBUG] WandB disabled via WANDB_DISABLED environment variable", flush=True)
-            # Create a dummy wandb object
-            class DummyWandb:
-                def init(self, *args, **kwargs):
-                    print("[WANDB] Skipped initialization (disabled)", flush=True)
-                    return self
-                def log(self, *args, **kwargs):
-                    pass
-                def finish(self, *args, **kwargs):
-                    pass
-                def __getattr__(self, name):
-                    return lambda *args, **kwargs: None
-            
-            wandb = DummyWandb()
-            wandb.init()  # Initialize dummy
-        else:
-            if not api_key_present:
-                # If no key, force offline to avoid interactive prompt
-                os.environ["WANDB_MODE"] = "offline"
-                print("[DEBUG] WANDB_API_KEY missing, switching to WANDB_MODE=offline", flush=True)
-
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=cfg.wandb_project,
-                name=f"ft+{run_id}",
-            )
-    else:
-        # For non-main processes, create a dummy wandb
-        class DummyWandb:
+        # Create a simple dummy logger for compatibility
+        class DummyLogger:
             def log(self, *args, **kwargs):
                 pass
             def finish(self, *args, **kwargs):
@@ -919,28 +913,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             def __getattr__(self, name):
                 return lambda *args, **kwargs: None
         
-        wandb = DummyWandb()
-    
-    # Initialize wandb logging
-    # if distributed_state.is_main_process:
-    #     wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
-    if distributed_state.is_main_process:
-        # Check if wandb should be disabled
-        if os.environ.get("WANDB_DISABLED", "false").lower() != "true":
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=cfg.wandb_project,
-                name=f"ft+{run_id}",
-            )
-        else:
-            print("[WANDB DISABLED] Skipping wandb initialization", flush=True)
-            # Create a dummy wandb object
-            class DummyWandb:
-                def log(self, *args, **kwargs):
-                    pass
-                def finish(self, *args, **kwargs):
-                    pass
-            wandb = DummyWandb()
+        wandb = DummyLogger()
+    else:
+        wandb = DummyLogger()
 
     # Print detected constants
     print(
@@ -1185,6 +1160,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     if distributed_state.is_main_process:
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
 
+    if distributed_state.is_main_process:
+        print(f"==========================================")
+        print(f"TensorBoard logs directory: {run_dir}")
+        print(f"To view logs: tensorboard --logdir={run_dir}")
+        print(f"==========================================")
+        
     # Create collator and dataloader
     collator = PaddedCollatorForActionPrediction(
         processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
@@ -1221,6 +1202,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         
     if distributed_state.is_main_process:
         tb_writer = SummaryWriter(log_dir=str(run_dir))
+        print(f"[TensorBoard] Logging to: {run_dir}")
     else:
         tb_writer = None
         
@@ -1267,9 +1249,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                # log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
-                log_metrics_to_wandb_and_tensorboard(smoothened_metrics, "VLA Train", log_step, wandb, tb_writer)
+            if tb_writer is not None and log_step % cfg.wandb_log_freq == 0:
+                log_metrics_to_tensorboard(smoothened_metrics, "VLA Train", log_step, tb_writer)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
@@ -1278,19 +1259,22 @@ def finetune(cfg: FinetuneConfig) -> None:
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_lr
 
-            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-                # Log the learning rate to wandb
-                wandb.log(
-                    {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
-                    },
-                    step=log_step,
-                )
-                # Also log to TensorBoard
-                if tb_writer is not None:
-                    tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
-                    tb_writer.flush()
-
+            # if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
+            #     # Log the learning rate to wandb
+            #     wandb.log(
+            #         {
+            #             "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+            #         },
+            #         step=log_step,
+            #     )
+            #     # Also log to TensorBoard
+            #     if tb_writer is not None:
+            #         tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
+            #         tb_writer.flush()
+            if tb_writer is not None and gradient_step_idx % cfg.wandb_log_freq == 0:
+                tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
+                tb_writer.flush()
+    
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
@@ -1343,20 +1327,20 @@ def finetune(cfg: FinetuneConfig) -> None:
     ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     
-    # Close TensorBoard writer
-    if distributed_state.is_main_process and tb_writer is not None:
+    if tb_writer is not None:
         tb_writer.close()
+        print("[TensorBoard] Writer closed")
 
     # 1) Save only the PEFT/OFT adapters, not the full 7B backbone
-    vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
-    print(f"[SAVE] Saving VLA adapters to {vla_adapter_dir}", flush=True)
-    vla.module.save_pretrained(vla_adapter_dir)  # <-- key line
+    # vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
+    # print(f"[SAVE] Saving VLA adapters to {vla_adapter_dir}", flush=True)
+    # vla.module.save_pretrained(vla_adapter_dir)  # <-- key line
 
-    # 2) Save action head weights (this is small, so torch.save is fine)
-    if cfg.use_l1_regression:
-        ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
-        print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
-        torch.save(action_head.module.state_dict(), ah_ckpt_path)
+    # # 2) Save action head weights (this is small, so torch.save is fine)
+    # if cfg.use_l1_regression:
+    #     ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
+    #     print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
+    #     torch.save(action_head.module.state_dict(), ah_ckpt_path)
 
 if __name__ == "__main__":
     finetune()
