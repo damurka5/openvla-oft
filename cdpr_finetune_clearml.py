@@ -25,7 +25,7 @@ def find_tfrecord_dir(dataset_root: str) -> str:
             candidates.append(cur_root)
 
     if not candidates:
-        # Extra debug: show what’s actually in the root
+        # Extra debug: show what's actually in the root
         print("[CDPR] No .tfrecord files found. Root dir contents:", flush=True)
         print(os.listdir(dataset_root), flush=True)
         raise FileNotFoundError(
@@ -45,12 +45,15 @@ def find_tfrecord_dir(dataset_root: str) -> str:
 
 
 def main():
-    # 1) Init ClearML task
+    # 1) Init ClearML task with TensorBoard support
     task = Task.init(project_name=PROJECT, task_name=TASK_NAME)
-
+    
+    # Enable TensorBoard auto-logging
+    task.connect_configuration({})
+    
     # 2) Get dataset from ClearML
     ds = Dataset.get(dataset_name="cdpr_synth_v1", dataset_project=PROJECT)
-    data_root = ds.get_local_copy()  # e.g. /clearml_agent_cache/storage_manager/datasets/ds_xxx
+    data_root = ds.get_local_copy()
 
     print(f"[CDPR] ClearML dataset root: {data_root}", flush=True)
 
@@ -78,11 +81,12 @@ def main():
 
     os.symlink(tfrecord_src, tfrecord_dest)
 
-    # 4) Env vars
+    # 4) Env vars - Disable WandB completely
     os.environ["VLA_ROBOT"] = "CDPR"
-    os.environ["WANDB_MODE"] = "online"
+    os.environ["WANDB_DISABLED"] = "true"
+    os.environ["WANDB_MODE"] = "offline"
 
-    # 5) Build torchrun command
+    # 5) Build torchrun command with TensorBoard setup
     cmd = [
         "torchrun",
         "--standalone",
@@ -107,21 +111,30 @@ def main():
         "--max_steps",
         "100",
         "--image_aug",
-        "False", 
-        "--wandb_entity", "damurka-innopolis-university",
-        "--wandb_project", "openvla-oft-cdpr",
+        "False",
+        # Disable WandB
+        "--use_wandb", "False",
+        # Optional: Give a fixed run ID for easier tracking
+        "--run_id_override", "cdpr_clearml_run",
+        # Optional: Change wandb entity/project to dummy values
+        "--wandb_entity", "dummy",
+        "--wandb_project", "dummy",
     ]
     
     print(f"[CDPR] CWD: {os.getcwd()}", flush=True)
     print(f"[CDPR] Script dir: {Path(__file__).resolve().parent}", flush=True)
 
-
     print("Running command:", " ".join(cmd), flush=True)
+    
+    # Tell ClearML where to look for TensorBoard logs
+    tensorboard_log_dir = "./VLA_CDPR/oft_cdpr_ckpts"
+    task.connect_tensorboard(tensorboard_log_dir)
+    
+    # Run training
     ret = subprocess.call(cmd)
 
-    # === NEW: upload the finetuned checkpoint folder as an artifact ===
-    # Use the repo root where THIS script lives
-    repo_root = Path(__file__).resolve().parent      # cdpr_finetune_clearml.py is in repo root
+    # Upload the finetuned checkpoint folder as an artifact
+    repo_root = Path(__file__).resolve().parent
     ckpt_root = repo_root / "VLA_CDPR" / "oft_cdpr_ckpts"
 
     if ckpt_root.exists():
@@ -130,6 +143,10 @@ def main():
             name="openvla_cdpr_finetuned",
             artifact_object=str(ckpt_root),
         )
+        
+        # Also manually upload any TensorBoard event files
+        for event_file in ckpt_root.glob("**/events.out.tfevents.*"):
+            print(f"[CDPR] Found TensorBoard event file: {event_file}", flush=True)
     else:
         print(f"[CDPR] WARNING: checkpoint root not found: {ckpt_root}", flush=True)
 

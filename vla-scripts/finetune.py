@@ -15,6 +15,7 @@ from datetime import datetime
 import draccus
 import torch
 import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import tqdm
 from accelerate import PartialState
@@ -780,6 +781,21 @@ def run_validation(
     if distributed_state.is_main_process:
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
 
+def start_tensorboard(log_dir):
+    import subprocess
+    import threading
+    
+    def run_tb():
+        subprocess.run([
+            "tensorboard",
+            "--logdir", log_dir,
+            "--port", "6006",
+            "--host", "0.0.0.0"
+        ])
+    
+    thread = threading.Thread(target=run_tb, daemon=True)
+    thread.start()
+    return thread
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -1111,6 +1127,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
+    tb_log_dir = "./VLA_CDPR/oft_cdpr_ckpts"
+    if os.path.exists(tb_log_dir):
+        tb_thread = start_tensorboard(tb_log_dir)
+        
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
