@@ -88,11 +88,25 @@ class L1RegressionActionHead(nn.Module):
         input_dim=4096,
         hidden_dim=4096,
         action_dim=7,
+        mlp_input_dim=None, 
     ):
+        # super().__init__()
+        # self.action_dim = action_dim
+        # self.model = MLPResNet(
+        #     num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
+        # )
         super().__init__()
         self.action_dim = action_dim
+
+        if mlp_input_dim is None:
+            # fallback for “normal” models
+            mlp_input_dim = input_dim * ACTION_DIM
+
         self.model = MLPResNet(
-            num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
+            num_blocks=2,
+            input_dim=mlp_input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=action_dim,
         )
 
     def predict_action(self, actions_hidden_states):

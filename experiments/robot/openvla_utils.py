@@ -249,63 +249,110 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
 
     return new_state_dict
 
+import torch
+from transformers import AutoModelForVision2Seq
 
-def get_vla(cfg: Any) -> torch.nn.Module:
+def get_vla(cfg):
     """
-    Load and initialize the VLA model from checkpoint.
-
-    Args:
-        cfg: Configuration object
-
-    Returns:
-        torch.nn.Module: The initialized VLA model
+    Load OpenVLA/OpenVLA-OFT in full precision (no 8/4-bit),
+    mirroring the original working config.
     """
     print("Instantiating pretrained VLA policy...")
 
-    # If loading a locally stored pretrained checkpoint, check whether config or model files
-    # need to be synced so that any changes the user makes to the VLA modeling code will
-    # actually go into effect
-    # If loading a pretrained checkpoint from Hugging Face Hub, we just assume that the policy
-    # will be used as is, with its original modeling logic
-    if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
-        # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-        AutoConfig.register("openvla", OpenVLAConfig)
-        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Update config.json and sync model files
-        update_auto_map(cfg.pretrained_checkpoint)
-        check_model_logic_mismatch(cfg.pretrained_checkpoint)
+    # bfloat16 on GPU (like the original code), float32 on CPU
+    torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
-    # Load the model
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
-        # attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
-        load_in_8bit=cfg.load_in_8bit,
-        load_in_4bit=cfg.load_in_4bit,
-        low_cpu_mem_usage=True,
         trust_remote_code=True,
+        torch_dtype=torch_dtype,
     )
 
-    # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
-    if cfg.use_film:
-        vla = _apply_film_to_vla(vla, cfg)
-
-    # Set number of images in model input
-    vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
-
-    vla.eval()
-
-    # Move model to device if not using quantization
-    if not cfg.load_in_8bit and not cfg.load_in_4bit:
-        vla = vla.to(DEVICE)
-
-    # Load dataset stats for action normalization
-    _load_dataset_stats(vla, cfg.pretrained_checkpoint)
-
+    vla = vla.to(device)
     return vla
+
+# def get_vla(cfg: Any) -> torch.nn.Module:
+#     """
+#     Load and initialize the VLA model from checkpoint.
+
+#     Args:
+#         cfg: Configuration object
+
+#     Returns:
+#         torch.nn.Module: The initialized VLA model
+#     """
+#     print("Instantiating pretrained VLA policy...")
+
+#     # If loading a locally stored pretrained checkpoint, check whether config or model files
+#     # need to be synced so that any changes the user makes to the VLA modeling code will
+#     # actually go into effect
+#     # If loading a pretrained checkpoint from Hugging Face Hub, we just assume that the policy
+#     # will be used as is, with its original modeling logic
+#     if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
+#         # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
+#         AutoConfig.register("openvla", OpenVLAConfig)
+#         AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+#         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+#         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+#         # Update config.json and sync model files
+#         update_auto_map(cfg.pretrained_checkpoint)
+#         check_model_logic_mismatch(cfg.pretrained_checkpoint)
+
+#     # Load the model
+#     # vla = AutoModelForVision2Seq.from_pretrained(
+#     #     cfg.pretrained_checkpoint,
+#     #     # attn_implementation="flash_attention_2",
+#     #     torch_dtype=torch.bfloat16,
+#     #     load_in_8bit=cfg.load_in_8bit,
+#     #     load_in_4bit=cfg.load_in_4bit,
+#     #     low_cpu_mem_usage=True,
+#     #     trust_remote_code=True,
+#     #     device_map="auto" if (cfg.load_in_8bit or cfg.load_in_4bit) else None,
+#     # )
+#     quantized = cfg.load_in_8bit or cfg.load_in_4bit
+
+#     # Decide torch dtype for non-quantized mode
+#     if torch.cuda.is_available():
+#         default_dtype = torch.bfloat16
+#     else:
+#         default_dtype = torch.float32
+        
+#     vla = AutoModelForVision2Seq.from_pretrained(
+#         cfg.pretrained_checkpoint,
+#         trust_remote_code=True,
+#         load_in_8bit=cfg.load_in_8bit,
+#         load_in_4bit=cfg.load_in_4bit,
+#         # CRITICAL: this prevents dispatch_model from calling `.to(device)`
+#         device_map="auto" if quantized else None,
+#         torch_dtype=default_dtype if not quantized else None,
+#     )
+
+#     # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
+#     if cfg.use_film:
+#         vla = _apply_film_to_vla(vla, cfg)
+
+#     # Set number of images in model input
+#     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+
+#     vla.eval()
+
+#     # Move model to device if not using quantization
+#     if not cfg.load_in_8bit and not cfg.load_in_4bit:
+#         vla = vla.to(DEVICE)
+
+#     # Load dataset stats for action normalization
+#     _load_dataset_stats(vla, cfg.pretrained_checkpoint)
+
+#     # For full-precision models we still move to the single DEVICE manually.
+#     # For 8-bit / 4-bit models, HF has already put modules on correct devices.
+#     if not quantized:
+#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         vla = vla.to(device)
+        
+#     return vla
 
 
 def _apply_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
@@ -407,30 +454,40 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
         llm_dim=llm_dim,
         proprio_dim=proprio_dim,
     ).to(DEVICE)
-    proprio_projector = proprio_projector.to(torch.bfloat16).to(DEVICE)
-    proprio_projector.eval()
+    # 👇 keep it in default dtype (float32); do NOT cast to bfloat16
+    # proprio_projector = proprio_projector.to(torch.bfloat16).to(DEVICE)
 
+    proprio_projector.eval()
+    
+    # Special case for CDPR or for 5-D proprio
+    if proprio_dim == 5 or getattr(cfg, "unnorm_key", "") == "cdpr_synth":
+        print("⚠️ Using freshly initialized 5-D proprio projector (no HF weights).")
+        return proprio_projector
+
+    try:
     # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
-    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
-        model_path_to_proprio_projector_name = {
-            "moojink/openvla-7b-oft-finetuned-libero-spatial": "proprio_projector--150000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-object": "proprio_projector--150000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-goal": "proprio_projector--50000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-10": "proprio_projector--150000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10": "proprio_projector--300000_checkpoint.pt",
-        }
-        if cfg.pretrained_checkpoint not in model_path_to_proprio_projector_name.keys():
-            raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
-        # Download proprio projector directly from HF Hub
-        proprio_projector_path = hf_hub_download(
-            repo_id=cfg.pretrained_checkpoint, filename=model_path_to_proprio_projector_name[cfg.pretrained_checkpoint]
-        )
-        state_dict = load_component_state_dict(proprio_projector_path)
-        proprio_projector.load_state_dict(state_dict)
-    else:
-        checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "proprio_projector")
-        state_dict = load_component_state_dict(checkpoint_path)
-        proprio_projector.load_state_dict(state_dict)
+        if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+            model_path_to_proprio_projector_name = {
+                "moojink/openvla-7b-oft-finetuned-libero-spatial": "proprio_projector--150000_checkpoint.pt",
+                "moojink/openvla-7b-oft-finetuned-libero-object": "proprio_projector--150000_checkpoint.pt",
+                "moojink/openvla-7b-oft-finetuned-libero-goal": "proprio_projector--50000_checkpoint.pt",
+                "moojink/openvla-7b-oft-finetuned-libero-10": "proprio_projector--150000_checkpoint.pt",
+                "moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10": "proprio_projector--300000_checkpoint.pt",
+            }
+            if cfg.pretrained_checkpoint not in model_path_to_proprio_projector_name.keys():
+                raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
+            # Download proprio projector directly from HF Hub
+            proprio_projector_path = hf_hub_download(
+                repo_id=cfg.pretrained_checkpoint, filename=model_path_to_proprio_projector_name[cfg.pretrained_checkpoint]
+            )
+            state_dict = load_component_state_dict(proprio_projector_path)
+            proprio_projector.load_state_dict(state_dict)
+        else:
+            checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "proprio_projector")
+            state_dict = load_component_state_dict(checkpoint_path)
+            proprio_projector.load_state_dict(state_dict)
+    except Exception as e:
+        print(f"⚠️ ProprioProjector: issue loading weights ({e}), using fresh init.")
 
     return proprio_projector
 
@@ -461,60 +518,121 @@ def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     return noisy_action_projector
 
 
-def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, DiffusionActionHead]:
+# def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, DiffusionActionHead]:
+#     """
+#     Get action head for continuous value prediction.
+
+#     Args:
+#         cfg: Configuration object with model parameters
+#         llm_dim: Dimension of the language model
+
+#     Returns:
+#         Union[L1RegressionActionHead, DiffusionActionHead]: The initialized action head
+
+#     Raises:
+#         AssertionError: If both L1 regression and diffusion are specified
+#     """
+#     assert not (cfg.use_l1_regression and cfg.use_diffusion), "Cannot use both L1 regression and diffusion action head!"
+
+#     # Initialize appropriate action head based on configuration
+#     if cfg.use_l1_regression:
+#         action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
+#     elif cfg.use_diffusion:
+#         action_head = DiffusionActionHead(
+#             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps_train=cfg.num_diffusion_steps_train
+#         )
+#         # Set number of diffusion steps for inference
+#         action_head.noise_scheduler.set_timesteps(cfg.num_diffusion_steps_inference)
+#     else:
+#         raise ValueError("Either use_l1_regression or use_diffusion must be True")
+
+#     action_head = action_head.to(torch.bfloat16).to(DEVICE)
+#     action_head.eval()
+
+#     # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
+#     if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+#         model_path_to_action_head_name = {
+#             "moojink/openvla-7b-oft-finetuned-libero-spatial": "action_head--150000_checkpoint.pt",
+#             "moojink/openvla-7b-oft-finetuned-libero-object": "action_head--150000_checkpoint.pt",
+#             "moojink/openvla-7b-oft-finetuned-libero-goal": "action_head--50000_checkpoint.pt",
+#             "moojink/openvla-7b-oft-finetuned-libero-10": "action_head--150000_checkpoint.pt",
+#             "moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10": "action_head--300000_checkpoint.pt",
+#         }
+#         if cfg.pretrained_checkpoint not in model_path_to_action_head_name.keys():
+#             raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
+#         # Download proprio projector directly from HF Hub
+#         action_head_path = hf_hub_download(
+#             repo_id=cfg.pretrained_checkpoint, filename=model_path_to_action_head_name[cfg.pretrained_checkpoint]
+#         )
+#         state_dict = load_component_state_dict(action_head_path)
+#         action_head.load_state_dict(state_dict)
+#     else:
+#         checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_head")
+#         state_dict = load_component_state_dict(checkpoint_path)
+#         action_head.load_state_dict(state_dict)
+
+#     return action_head
+from prismatic.vla.constants import ACTION_DIM
+from prismatic.models.action_heads import L1RegressionActionHead
+
+def get_action_head(cfg, llm_dim):
     """
-    Get action head for continuous value prediction.
+    Construct the L1RegressionActionHead for continuous actions.
 
-    Args:
-        cfg: Configuration object with model parameters
-        llm_dim: Dimension of the language model
+    For CDPR, we build the head to match the CURRENT model geometry:
+      - input_dim = llm_dim
+      - mlp_input_dim = llm_dim * ACTION_DIM
+      - action_dim = ACTION_DIM (5)
 
-    Returns:
-        Union[L1RegressionActionHead, DiffusionActionHead]: The initialized action head
-
-    Raises:
-        AssertionError: If both L1 regression and diffusion are specified
+    If a checkpoint is provided (cfg.cdpr_action_head_path), we load ONLY the
+    weights whose shapes match this geometry. Any mismatched layers (e.g. from
+    an older run with different dims) are left at their random init.
     """
-    assert not (cfg.use_l1_regression and cfg.use_diffusion), "Cannot use both L1 regression and diffusion action head!"
 
-    # Initialize appropriate action head based on configuration
-    if cfg.use_l1_regression:
-        action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
-    elif cfg.use_diffusion:
-        action_head = DiffusionActionHead(
-            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps_train=cfg.num_diffusion_steps_train
-        )
-        # Set number of diffusion steps for inference
-        action_head.noise_scheduler.set_timesteps(cfg.num_diffusion_steps_inference)
+    # Base head matching the current model geometry
+    expected_mlp_input_dim = llm_dim * ACTION_DIM
+
+    action_head = L1RegressionActionHead(
+        input_dim=llm_dim,
+        hidden_dim=llm_dim,
+        action_dim=ACTION_DIM,
+        mlp_input_dim=expected_mlp_input_dim,
+    )
+
+    ckpt_path = getattr(cfg, "cdpr_action_head_path", None)
+    if ckpt_path and os.path.exists(ckpt_path):
+        state = torch.load(ckpt_path, map_location="cpu")
+
+        if isinstance(state, dict):
+            own_state = action_head.state_dict()
+            filtered = {}
+            skipped = []
+
+            for k, v in state.items():
+                if k in own_state and own_state[k].shape == v.shape:
+                    filtered[k] = v
+                else:
+                    skipped.append(k)
+
+            if filtered:
+                action_head.load_state_dict(filtered, strict=False)
+                print(f"✅ Partially loaded CDPR action head weights "
+                      f"({len(filtered)} tensors, {len(skipped)} skipped)")
+            else:
+                print("⚠️ CDPR action head checkpoint has no matching shapes; "
+                      "using freshly initialized head.")
+        elif isinstance(state, torch.nn.Module):
+            # If somehow the checkpoint is a full module with the right shape
+            action_head = state
+            print("✅ Loaded CDPR action head module directly")
+        else:
+            print("⚠️ Unknown action head checkpoint format; using base head.")
+
     else:
-        raise ValueError("Either use_l1_regression or use_diffusion must be True")
-
-    action_head = action_head.to(torch.bfloat16).to(DEVICE)
-    action_head.eval()
-
-    # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
-    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
-        model_path_to_action_head_name = {
-            "moojink/openvla-7b-oft-finetuned-libero-spatial": "action_head--150000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-object": "action_head--150000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-goal": "action_head--50000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-10": "action_head--150000_checkpoint.pt",
-            "moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10": "action_head--300000_checkpoint.pt",
-        }
-        if cfg.pretrained_checkpoint not in model_path_to_action_head_name.keys():
-            raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
-        # Download proprio projector directly from HF Hub
-        action_head_path = hf_hub_download(
-            repo_id=cfg.pretrained_checkpoint, filename=model_path_to_action_head_name[cfg.pretrained_checkpoint]
-        )
-        state_dict = load_component_state_dict(action_head_path)
-        action_head.load_state_dict(state_dict)
-    else:
-        checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_head")
-        state_dict = load_component_state_dict(checkpoint_path)
-        action_head.load_state_dict(state_dict)
+        print("⚠️ No CDPR action head checkpoint provided; using base head.")
 
     return action_head
+
 
 
 def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, int]]) -> np.ndarray:
@@ -826,19 +944,26 @@ def get_vla_action(
         # Process proprioception data if used
         proprio = None
         if cfg.use_proprio:
-            proprio = obs["state"]
-            proprio_norm_stats = vla.norm_stats[cfg.unnorm_key]["proprio"]
-            obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
-            proprio = obs["state"]
+            # just use raw 5-D state; CDPR projector was trained to accept this
+            proprio_np = obs["state"].astype(np.float32)
+            # If you really want to keep the log:
+            print(
+                f"⚠️ No proprio normalization stats for key '{cfg.unnorm_key}'. Using raw proprio."
+            )
+
+            # convert to tensor matching the rest of the policy path (bf16 on DEVICE)
+            proprio = torch.as_tensor(proprio_np, device=DEVICE, dtype=torch.bfloat16)
 
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
             action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
         else:
-            # Custom action head for continuous actions
+            # Custom action head for continuous actions (CDPR)
             action, _ = vla.predict_action(
                 **inputs,
+                # For CDPR we do NOT use dataset stats; the head already outputs
+                # metric actions, so skip unnormalization logic entirely.
                 unnorm_key=cfg.unnorm_key,
                 do_sample=False,
                 proprio=proprio,

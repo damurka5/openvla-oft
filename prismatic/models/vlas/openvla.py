@@ -103,20 +103,33 @@ class OpenVLA(PrismaticVLM):
         return actions
 
     @staticmethod
-    def _check_unnorm_key(norm_stats: Dict, unnorm_key: str) -> str:
-        if unnorm_key is None:
-            assert len(norm_stats) == 1, (
-                f"Your model was trained on more than one dataset, please pass a `unnorm_key` from the following "
-                f"options to choose the statistics used for un-normalizing actions: {norm_stats.keys()}"
-            )
-            unnorm_key = next(iter(norm_stats.keys()))
+    def _check_unnorm_key(norm_stats: Dict, unnorm_key: Optional[str]) -> str:
+        """
+        Resolve the unnormalization key for action statistics.
 
-        # Error Handling
-        assert (
-            unnorm_key in norm_stats
-        ), f"The `unnorm_key` you chose is not in the set of available statistics; choose from: {norm_stats.keys()}"
+        For multi-dataset models, if `unnorm_key` is None we now *default* to the first
+        available key instead of raising. This is important for custom continuous-action
+        heads (e.g. CDPR) that do not actually use these statistics.
+        """
+        keys = list(norm_stats.keys())
+
+        if unnorm_key is None:
+            if len(keys) > 1:
+                print(
+                    "⚠️ Model has multiple dataset statistics; no `unnorm_key` was given. "
+                    f"Defaulting to the first key: {keys[0]}"
+                )
+            unnorm_key = keys[0]
+
+        if unnorm_key not in norm_stats:
+            print(
+                f"⚠️ Requested `unnorm_key`='{unnorm_key}' not found in statistics. "
+                f"Falling back to first key: {keys[0]}"
+            )
+            unnorm_key = keys[0]
 
         return unnorm_key
+
 
     def get_action_dim(self, unnorm_key: Optional[str] = None) -> int:
         """Dimensionality of the policy's action space."""

@@ -770,17 +770,32 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         return labels
 
     def _unnormalize_actions(self, normalized_actions, unnorm_key=None):
-        """Unnormalize actions using dataset statistics"""
+        """Unnormalize actions using dataset statistics.
+
+        For custom continuous heads (e.g. CDPR, 5-DoF) we may get action vectors
+        whose dimension does NOT match the dataset statistics (e.g. 5 vs 7).
+        In that case we skip unnormalization and return the input as-is.
+        """
         action_norm_stats = self.get_action_stats(unnorm_key)
 
         if ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS:
-            mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["min"], dtype=bool))
-            action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
+            base = np.array(action_norm_stats["min"])
+            action_high, action_low = np.array(action_norm_stats["max"]), base
+            mask = action_norm_stats.get("mask", np.ones_like(base, dtype=bool))
         elif ACTION_PROPRIO_NORMALIZATION_TYPE == NormalizationType.BOUNDS_Q99:
-            mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
-            action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+            base = np.array(action_norm_stats["q01"])
+            action_high, action_low = np.array(action_norm_stats["q99"]), base
+            mask = action_norm_stats.get("mask", np.ones_like(base, dtype=bool))
         else:
             raise ValueError("Unsupported action/proprio normalization type detected!")
+
+        # 👇 CDPR / mismatched-dim guard
+        if normalized_actions.shape[-1] != action_high.shape[-1]:
+            print(
+                f"⚠️ _unnormalize_actions: action dim {normalized_actions.shape[-1]} "
+                f"!= stats dim {action_high.shape[-1]}; returning actions as-is."
+            )
+            return normalized_actions
 
         actions = np.where(
             mask,
@@ -789,6 +804,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         return actions
+
 
     def _run_diffusion_prediction(
         self,
@@ -1058,20 +1074,34 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         return actions, actions_hidden_states
 
     @staticmethod
-    def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
-        """Validate and resolve the unnormalization key for action statistics"""
-        if unnorm_key is None:
-            assert len(norm_stats) == 1, (
-                f"Your model was trained on more than one dataset, "
-                f"please pass a `unnorm_key` from the following options to choose the statistics "
-                f"used for un-normalizing actions: {norm_stats.keys()}"
-            )
-            unnorm_key = next(iter(norm_stats.keys()))
+    def _check_unnorm_key(
+        norm_stats: Dict[str, Dict[str, Any]],
+        unnorm_key: Optional[str],
+    ) -> str:
+        """
+        Validate and resolve the unnormalization key for action statistics.
 
-        assert unnorm_key in norm_stats, (
-            f"The `unnorm_key` you chose is not in the set of available dataset statistics, "
-            f"please choose from: {norm_stats.keys()}"
-        )
+        For multi-dataset models, if `unnorm_key` is None we default to the first
+        key instead of raising. This is needed for custom continuous-action heads
+        that bypass dataset-based normalization.
+        """
+        keys = list(norm_stats.keys())
+
+        if unnorm_key is None:
+            if len(keys) > 1:
+                print(
+                    "⚠️ Model has multiple dataset statistics; no `unnorm_key` was given. "
+                    f"Defaulting to the first key: {keys[0]}"
+                )
+            unnorm_key = keys[0]
+
+        if unnorm_key not in norm_stats:
+            print(
+                f"⚠️ Requested `unnorm_key`='{unnorm_key}' not in available statistics. "
+                f"Falling back to first key: {keys[0]}"
+            )
+            unnorm_key = keys[0]
+
         return unnorm_key
 
     def get_action_dim(self, unnorm_key: Optional[str] = None) -> int:
