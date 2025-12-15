@@ -33,6 +33,12 @@ def find_tfrecord_dir(dataset_root: str) -> str:
             f"Check what you added to the ClearML dataset."
         )
 
+    # prefer human_control
+    for c in candidates:
+        if "tfrecords_human_control" in c:
+            print(f"[CDPR] Selected TFRecord directory (human_control preferred): {c}", flush=True)
+            return c
+
     # Prefer a directory whose path looks like your original
     for c in candidates:
         if "libero_spatial_no_noops" in c:
@@ -50,7 +56,7 @@ def main():
     task = Task.current_task() or Task.init(project_name=PROJECT, task_name=TASK_NAME)
     
     # 2) Get dataset from ClearML
-    ds = Dataset.get(dataset_name="cdpr_synth_v1", dataset_project=PROJECT)
+    ds = Dataset.get(dataset_name="cdpr_human_control_only", dataset_project=PROJECT)
     data_root = ds.get_local_copy()
 
     print(f"[CDPR] ClearML dataset root: {data_root}", flush=True)
@@ -111,7 +117,7 @@ def main():
         "--learning_rate",
         "1e-4",
         "--max_steps",
-        "1000",
+        "100", # 1000
         "--image_aug",
         "False",
         # Disable WandB - but the script doesn't have this argument!
