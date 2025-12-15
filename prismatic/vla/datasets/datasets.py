@@ -177,18 +177,25 @@ class RLDSBatchTransform:
         future_actions = actions[1:1+max_future_actions, 0]  # Shape: (max_future_actions, 5)
         print(f"[DEBUG] Limited future actions shape: {future_actions.shape}", flush=True)
 
-        # FIX: Tokenize actions properly
-        try:
-            current_action_string = self.action_tokenizer(current_action)
-            future_actions_string = ''.join([self.action_tokenizer(action) for action in future_actions])
-        except Exception as e:
-            print(f"[ERROR] Action tokenizer failed: {e}", flush=True)
-            current_action_string = ''
-            future_actions_string = ''
+        # # FIX: Tokenize actions properly
+        # try:
+        #     current_action_string = self.action_tokenizer(current_action)
+        #     future_actions_string = ''.join([self.action_tokenizer(action) for action in future_actions])
+        # except Exception as e:
+        #     print(f"[ERROR] Action tokenizer failed: {e}", flush=True)
+        #     current_action_string = ''
+        #     future_actions_string = ''
 
-        action_chunk_string = current_action_string + future_actions_string
+        # action_chunk_string = current_action_string + future_actions_string
+        # action_chunk_len = len(action_chunk_string)
+        
+        # Use the first timestep's full action chunk (shape: (8, 5))
+        action_chunk = actions[0]  # (NUM_ACTIONS_CHUNK, ACTION_DIM)
+
+        action_chunk_string = ''.join(self.action_tokenizer(a) for a in action_chunk)
         action_chunk_len = len(action_chunk_string)
 
+        print(f"[DEBUG] action_chunk shape: {action_chunk.shape}", flush=True)
         print(f"[DEBUG TOKENS] Action chunk string length: {action_chunk_len}", flush=True)
         print(f"[DEBUG TOKENS] Action chunk preview: {action_chunk_string[:100]}...", flush=True)
 
