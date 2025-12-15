@@ -58,6 +58,20 @@ def main():
     # 2) Get dataset from ClearML
     ds = Dataset.get(dataset_name="cdpr_human_control_only", dataset_project=PROJECT)
     data_root = ds.get_local_copy()
+    
+    meta_src  = os.path.join(data_root, "meta_dataset.json")
+    stats_src = os.path.join(data_root, "action_stats_libero_spatial_no_noops.json")
+
+    meta_dest  = "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/meta_dataset.json"
+    stats_dest = "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/action_stats_libero_spatial_no_noops.json"
+
+    for src, dest in [(meta_src, meta_dest), (stats_src, stats_dest)]:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.islink(dest) or os.path.exists(dest):
+            os.remove(dest)
+        os.symlink(src, dest)
+        print("[CDPR] Linked", dest, "->", os.path.realpath(dest), flush=True)
+
 
     print(f"[CDPR] ClearML dataset root: {data_root}", flush=True)
 
@@ -84,6 +98,14 @@ def main():
             shutil.rmtree(tfrecord_dest)
 
     os.symlink(tfrecord_src, tfrecord_dest)
+    
+    real = os.path.realpath(tfrecord_dest)
+    print("[CDPR] Symlink points to:", real, flush=True)
+
+    import glob
+    matches = glob.glob(os.path.join(real, "libero_spatial_no_noops-train-*.tfrecord"))
+    print(f"[CDPR] Matched TFRecords: {len(matches)}", flush=True)
+    print("[CDPR] Example:", matches[:3], flush=True)
 
     # 4) Env vars - Disable WandB completely
     os.environ["VLA_ROBOT"] = "CDPR"
