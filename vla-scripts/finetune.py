@@ -383,11 +383,33 @@ def run_forward_pass(
         text_hidden_states = last_hidden_states[:, num_patches:-1]
         # Get hidden states for action portion of response
         batch_size = batch["input_ids"].shape[0]
-        actions_hidden_states = (
-            text_hidden_states[current_action_mask | next_actions_mask]
-            .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
-            .to(torch.bfloat16)
-        )  # (B, act_chunk_len, D)
+        print("[DEBUG RF] action_logits shape before reshape:", text_hidden_states[current_action_mask | next_actions_mask].shape, flush=True)
+        print("[DEBUG RF] numel:", text_hidden_states[current_action_mask | next_actions_mask].numel(), "batch:", batch_size, flush=True)
+
+        # actions_hidden_states = (
+        #     text_hidden_states[current_action_mask | next_actions_mask]
+        #     .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
+        #     .to(torch.bfloat16)
+        # )  # (B, act_chunk_len, D)
+        # Get hidden states for action portion of response
+        batch_size = batch["input_ids"].shape[0]
+        action_mask = (current_action_mask | next_actions_mask)  # shape (B, S_text)
+
+        flat = text_hidden_states[action_mask]                   # shape (B*N, D) because mask flattens
+        D = flat.shape[-1]
+
+        # Convert back to per-batch sequences (assumes each example has same #masked tokens)
+        flat = flat.view(batch_size, -1, D)                      # (B, N_masked, D)
+
+        expected = NUM_ACTIONS_CHUNK * ACTION_DIM                # 40
+
+        # If the stop token is included, N_masked will be 41. Drop extras (usually last token).
+        if flat.shape[1] != expected:
+            print(f"[DEBUG RF] masked tokens per batch={flat.shape[1]}, expected={expected} (dropping extras)", flush=True)
+        flat = flat[:, :expected, :]                             # keep only first 40 tokens
+
+        actions_hidden_states = flat.to(torch.bfloat16)          # (B, 40, D)
+
 
         if use_l1_regression:
             # Predict action
