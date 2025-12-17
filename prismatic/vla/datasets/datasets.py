@@ -191,12 +191,13 @@ class RLDSBatchTransform:
         
         # Use the first timestep's full action chunk (shape: (8, 5))
         action_chunk = actions[0]  # (NUM_ACTIONS_CHUNK, ACTION_DIM)
-
+        
         action_chunk_string = ''.join(self.action_tokenizer(a) for a in action_chunk)
-        action_chunk_len = len(action_chunk_string)
+        action_token_ids = self.base_tokenizer(action_chunk_string, add_special_tokens=False).input_ids
+        action_chunk_token_len = len(action_token_ids)
 
         print(f"[DEBUG] action_chunk shape: {action_chunk.shape}", flush=True)
-        print(f"[DEBUG TOKENS] Action chunk string length: {action_chunk_len}", flush=True)
+        print(f"[DEBUG TOKENS] Action chunk string length: {action_chunk_token_len}", flush=True)
         print(f"[DEBUG TOKENS] Action chunk preview: {action_chunk_string[:100]}...", flush=True)
 
         conversation = [
@@ -218,7 +219,7 @@ class RLDSBatchTransform:
         pixel_values = self.image_transform(img)
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
+        labels[: -(action_chunk_token_len + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
@@ -253,6 +254,8 @@ class RLDSBatchTransform:
         print(f"[DEBUG TOKENS] Input IDs length: {len(input_ids)}", flush=True)
         print(f"[DEBUG TOKENS] Action chunk string length: {len(action_chunk_string)}", flush=True)
         print(f"[DEBUG TOKENS] Action chunk tokens: {action_chunk_string}", flush=True)
+        print("[DEBUG TOKENS] action_chunk_token_len:", action_chunk_token_len, flush=True)
+
         return return_dict
 
 class RLDSDataset(IterableDataset):

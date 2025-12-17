@@ -88,37 +88,56 @@ class L1RegressionActionHead(nn.Module):
         input_dim=4096,
         hidden_dim=4096,
         action_dim=7,
-        mlp_input_dim=None, 
+        mlp_input_dim=None,
     ):
-        # super().__init__()
-        # self.action_dim = action_dim
-        # self.model = MLPResNet(
-        #     num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
-        # )
         super().__init__()
         self.action_dim = action_dim
+        self.input_dim = input_dim
 
-        if mlp_input_dim is None:
-            # fallback for “normal” models
-            mlp_input_dim = input_dim * ACTION_DIM
+        # IMPORTANT:
+        # With your pipeline, per action-chunk we feed ACTION_DIM token hidden-states,
+        # each of size input_dim, flattened -> ACTION_DIM * input_dim.
+        expected_mlp_input_dim = input_dim * ACTION_DIM
+
+        # If something upstream passes a wrong mlp_input_dim (e.g., 28160), override it.
+        if mlp_input_dim is not None and mlp_input_dim != expected_mlp_input_dim:
+            print(
+                f"[DEBUG ACTION_HEAD] Overriding mlp_input_dim={mlp_input_dim} "
+                f"-> expected {expected_mlp_input_dim} (input_dim={input_dim}, ACTION_DIM={ACTION_DIM})",
+                flush=True,
+            )
+        mlp_input_dim = expected_mlp_input_dim
 
         self.model = MLPResNet(
             num_blocks=2,
             input_dim=mlp_input_dim,
             hidden_dim=hidden_dim,
-            output_dim=action_dim,
+            output_dim=action_dim,  # predicts one ACTION_DIM-vector per chunk
         )
 
     def predict_action(self, actions_hidden_states):
-        # actions_hidden_states: last hidden states of Transformer corresponding to action tokens in sequence
-        # - shape: (batch_size, chunk_len * action_dim, hidden_dim)
-        # ground_truth_actions: ground-truth actions
-        # - shape: (batch_size, chunk_len, action_dim)
-        batch_size = actions_hidden_states.shape[0]
-        device = actions_hidden_states.device
-        rearranged_actions_hidden_states = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
-        action = self.model(rearranged_actions_hidden_states)
-        return action
+        """
+        actions_hidden_states:
+          - expected shape: (B, NUM_ACTIONS_CHUNK * ACTION_DIM, input_dim)
+            e.g. (1, 40, 4096)
+        returns:
+          - shape: (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
+            e.g. (1, 8, 5)
+        """
+        B = actions_hidden_states.shape[0]
+        # (B, 40, 4096) -> (B, 8, 5, 4096) -> (B, 8, 20480)
+        x = actions_hidden_states.view(B, NUM_ACTIONS_CHUNK, ACTION_DIM, self.input_dim)
+        x = x.reshape(B, NUM_ACTIONS_CHUNK, ACTION_DIM * self.input_dim)
+
+        # MLPResNet expects 2D, so flatten chunk dimension into batch:
+        x = x.reshape(B * NUM_ACTIONS_CHUNK, -1)  # (B*8, 20480)
+
+        y = self.model(x)  # (B*8, ACTION_DIM)
+
+        # reshape back:
+        y = y.view(B, NUM_ACTIONS_CHUNK, self.action_dim)  # (B, 8, 5)
+        return y
+
 
 class NoisePredictionModel(nn.Module):
     """
