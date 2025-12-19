@@ -189,27 +189,45 @@ class RLDSBatchTransform:
         # action_chunk_string = current_action_string + future_actions_string
         # action_chunk_len = len(action_chunk_string)
         
-        # Use the first timestep's full action chunk (shape: (8, 5))
-        action_chunk = actions[0]  # (NUM_ACTIONS_CHUNK, ACTION_DIM)
-        
-        action_chunk_string = ''.join(self.action_tokenizer(a) for a in action_chunk)
-        action_token_ids = self.base_tokenizer(action_chunk_string, add_special_tokens=False).input_ids
-        action_chunk_token_len = len(action_token_ids)
+        # action_chunk: (NUM_ACTIONS_CHUNK, ACTION_DIM)
+        action_chunk = actions[0]
 
-        print(f"[DEBUG] action_chunk shape: {action_chunk.shape}", flush=True)
-        print(f"[DEBUG TOKENS] Action chunk string length: {action_chunk_token_len}", flush=True)
-        print(f"[DEBUG TOKENS] Action chunk preview: {action_chunk_string[:100]}...", flush=True)
+        # NEW: stable token ids, length exactly NUM_ACTIONS_CHUNK * ACTION_DIM (=40)
+        action_token_ids = self.action_tokenizer.encode_chunk_to_token_ids(action_chunk)
+        assert len(action_token_ids) == NUM_ACTIONS_CHUNK * ACTION_DIM, \
+            f"Expected {NUM_ACTIONS_CHUNK*ACTION_DIM} action token ids, got {len(action_token_ids)}"
 
+        # Build prompt prefix (assistant turn value empty)
+        prompt_builder = self.prompt_builder_fn("openvla")
         conversation = [
             {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": action_chunk_string},
+            {"from": "gpt", "value": ""},  # IMPORTANT: empty assistant content here
         ]
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
 
-        # Tokenize (w/ `base_tokenizer`)
-        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
+        prefix_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
+
+        # Avoid double-eos if tokenizer already appended it
+        eos = self.base_tokenizer.eos_token_id
+        if eos is not None and len(prefix_ids) > 0 and prefix_ids[-1] == eos:
+            prefix_ids = prefix_ids[:-1]
+
+        # Final input = prefix + action_token_ids + eos
+        input_ids = prefix_ids + action_token_ids + ([eos] if eos is not None else [])
         labels = list(input_ids)
+
+        # Mask everything except the action tokens (+ optionally eos)
+        # Here we predict action tokens and eos. If you don't want eos loss, mask it below.
+        prefix_len = len(prefix_ids)
+        labels[:prefix_len] = [IGNORE_INDEX] * prefix_len
+
+        if not self.predict_stop_token and eos is not None:
+            labels[-1] = IGNORE_INDEX
+
+        input_ids = torch.tensor(input_ids)
+        labels = torch.tensor(labels)
+
 
         print(f"[DEBUG TOKENS] Total input IDs length: {len(input_ids)}", flush=True)
         print(f"[DEBUG TOKENS] Base tokenizer vocab size: {self.base_tokenizer.vocab_size}", flush=True)

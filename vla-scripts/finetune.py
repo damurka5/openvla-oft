@@ -62,7 +62,8 @@ from prismatic.vla.constants import (
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-from clearml import Task
+# from clearml import Task
+from prismatic.models.vlas.openvla import replace_action_head_if_shape_mismatch
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -910,6 +911,12 @@ def log_metrics_to_tensorboard_and_clearml(metrics, prefix, step, tb_writer=None
     )
     print(f"[Step {step}] {prefix}: {pretty}", flush=True)
 
+def load_state_dict_skip_action_head(model, state_dict):
+    # Drop any action_head params from checkpoint so your fresh head stays consistent
+    filtered = {k: v for k, v in state_dict.items() if not k.startswith("action_head.")}
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    print(f"[LOAD] missing={len(missing)} unexpected={len(unexpected)} (action_head skipped)", flush=True)
+
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -927,15 +934,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
-    clearml_task = Task.current_task() if Task is not None else None
+    # clearml_task = Task.current_task() if Task is not None else None
 
-    if clearml_task is None and Task is not None:
-        clearml_task = Task.init(
-            project_name="CDPR",
-            task_name="openvla-7b-oft-cdpr-a100",
-        )
+    # if clearml_task is None and Task is not None:
+    #     clearml_task = Task.init(
+    #         project_name="CDPR",
+    #         task_name="openvla-7b-oft-cdpr-a100",
+    #     )
 
-    logger = clearml_task.get_logger() if clearml_task is not None else None
+    # logger = clearml_task.get_logger() if clearml_task is not None else None
 
     
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
@@ -1023,6 +1030,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     ).to(device_id)
+    
+    replace_action_head_if_shape_mismatch(vla)
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -1053,7 +1062,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
         if cfg.resume:
             state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
-            vla.model.vision_backbone.load_state_dict(state_dict)
+            # vla.model.vision_backbone.load_state_dict(state_dict)
+            load_state_dict_skip_action_head(vla, state_dict)
+            
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
     # Wrap VLA with DDP
@@ -1309,14 +1320,14 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-            if tb_writer is not None and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_tensorboard_and_clearml(
-                        smoothened_metrics,
-                        "VLA Train",
-                        log_step,
-                        tb_writer=tb_writer,
-                        clr_logger=logger,
-                    )
+            # if tb_writer is not None and log_step % cfg.wandb_log_freq == 0:
+            #     log_metrics_to_tensorboard_and_clearml(
+            #             smoothened_metrics,
+            #             "VLA Train",
+            #             log_step,
+            #             tb_writer=tb_writer,
+            #             clr_logger=logger,
+            #         )
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:

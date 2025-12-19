@@ -124,6 +124,9 @@ class L1RegressionActionHead(nn.Module):
           - shape: (B, NUM_ACTIONS_CHUNK, ACTION_DIM)
             e.g. (1, 8, 5)
         """
+        assert actions_hidden_states.shape[-1] == self.input_dim, \
+    f"Hidden size mismatch: got {actions_hidden_states.shape[-1]}, expected {self.input_dim}"
+
         B = actions_hidden_states.shape[0]
         # (B, 40, 4096) -> (B, 8, 5, 4096) -> (B, 8, 20480)
         x = actions_hidden_states.view(B, NUM_ACTIONS_CHUNK, ACTION_DIM, self.input_dim)

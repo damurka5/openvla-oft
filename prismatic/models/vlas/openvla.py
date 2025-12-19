@@ -19,6 +19,67 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
+# prismatic/models/openvla.py (or prismatic/models/vla.py / model builder file)
+
+import torch
+from prismatic.vla.constants import ACTION_DIM
+from prismatic.models.action_heads import L1RegressionActionHead
+
+def build_l1_action_head_for_model(vla_model) -> L1RegressionActionHead:
+    """
+    Build an L1RegressionActionHead using the *actual* LLM hidden size of the loaded model.
+    This prevents the 5632 vs 4096 mismatch and also ensures action_dim matches ACTION_DIM.
+    """
+    # Try common attribute names; adjust if your model uses different names
+    if hasattr(vla_model, "language_model") and hasattr(vla_model.language_model, "config"):
+        hidden_size = int(vla_model.language_model.config.hidden_size)
+    elif hasattr(vla_model, "llm") and hasattr(vla_model.llm, "config"):
+        hidden_size = int(vla_model.llm.config.hidden_size)
+    else:
+        raise RuntimeError("Cannot find language model hidden size on vla_model.")
+
+    head = L1RegressionActionHead(
+        input_dim=hidden_size,        # must match actions_hidden_states.shape[-1] (4096 in your logs)
+        hidden_dim=hidden_size,
+        action_dim=ACTION_DIM,        # 5 for CDPR
+        mlp_input_dim=None,           # your head will compute expected automatically
+    )
+    print(f"[ACTION_HEAD BUILD] hidden_size={hidden_size}, action_dim={ACTION_DIM}", flush=True)
+    return head
+
+
+def replace_action_head_if_shape_mismatch(vla_model):
+    """
+    If the current head was loaded from a checkpoint with incompatible shapes,
+    replace it with a fresh head that matches the current model + ACTION_DIM.
+    """
+    # Find the head (adjust attribute name if different)
+    head = getattr(vla_model, "action_head", None)
+    if head is None:
+        vla_model.action_head = build_l1_action_head_for_model(vla_model)
+        return
+
+    # Determine expected hidden size
+    if hasattr(vla_model, "language_model") and hasattr(vla_model.language_model, "config"):
+        expected_hidden = int(vla_model.language_model.config.hidden_size)
+    elif hasattr(vla_model, "llm") and hasattr(vla_model.llm, "config"):
+        expected_hidden = int(vla_model.llm.config.hidden_size)
+    else:
+        raise RuntimeError("Cannot find language model hidden size on vla_model.")
+
+    # Replace if mismatch
+    head_input_dim = int(getattr(head, "input_dim", -1))
+    head_action_dim = int(getattr(head, "action_dim", -1))
+    if head_input_dim != expected_hidden or head_action_dim != ACTION_DIM:
+        print(
+            f"[ACTION_HEAD REPLACE] old(input_dim={head_input_dim}, action_dim={head_action_dim}) "
+            f"!= expected(input_dim={expected_hidden}, action_dim={ACTION_DIM}). Reinitializing head.",
+            flush=True,
+        )
+        vla_model.action_head = build_l1_action_head_for_model(vla_model)
+    else:
+        print("[ACTION_HEAD KEEP] head dims already match model.", flush=True)
+
 
 class OpenVLA(PrismaticVLM):
     def __init__(
