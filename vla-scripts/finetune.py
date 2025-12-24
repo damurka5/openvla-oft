@@ -289,56 +289,50 @@ def run_forward_pass(
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    Compute model forward pass and metrics for both training and validation.
+    metrics: Dict[str, float] = {}
 
-    Args:
-        vla (OpenVLAForActionPrediction): Vision-language-action policy.
-        action_head (nn.Module): Action head module.
-        noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
-        proprio_projector (nn.Module): Proprioceptive state projector module.
-        batch (dict): Input batch.
-        action_tokenizer (ActionTokenizer): Action tokenizer.
-        device_id (str): Device ID.
-        use_l1_regression (bool): Whether to use L1 regression.
-        use_diffusion (bool): Whether to use diffusion.
-        use_proprio (bool): Whether to use proprioceptive state as input.
-        use_film (bool): Whether to use FiLM for better language following.
-        num_patches (int): Number of vision patches.
-        compute_diffusion_l1 (bool): Whether to sample actions and compute L1 loss for diffusion (do this once every
-                                    diffusion_sample_freq steps during training; do it every batch for validation)
-        num_diffusion_steps_train (int): Number of diffusion steps for training (only used for diffusion).
+    # ---- Move core tensors to device early ----
+    input_ids = batch["input_ids"].to(device_id)
+    attention_mask = batch["attention_mask"].to(device_id)
+    labels = batch["labels"].to(device_id)
 
-    Returns:
-        tuple: (loss, metrics_dict)
-            loss: The loss tensor with gradient for backpropagation.
-            metrics_dict: Dictionary of computed metrics (detached values for logging).
-    """
-    metrics = {}
+    # Ground-truth continuous actions for L1/diffusion paths
+    ground_truth_actions = batch["actions"].to(device_id)
 
-    # Get ground-truth action labels
-    ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
+    # If your batch sometimes carries extra dims (legacy), normalize to (B, 8, 5)
+    # Examples seen in forks: (B, 1, 8, 5) or (B, T, 8, 5)
+    if ground_truth_actions.dim() == 4:
+        # Prefer the "current frame" slice at index 0 (or -1 depending on your pipeline).
+        # Most RLDS pipelines provide current frame at index 0 after chunking.
+        ground_truth_actions = ground_truth_actions[:, 0]
+    elif ground_truth_actions.dim() == 3:
+        pass
+    else:
+        raise ValueError(f"Expected ground_truth_actions rank 3 or 4, got {ground_truth_actions.shape}")
 
-    # [Only for diffusion] Sample noisy actions used as input for noise predictor network
+    # Cast for autocast region
+    ground_truth_actions = ground_truth_actions.to(torch.bfloat16)
+
+    # ---- Diffusion noisy inputs ----
     if use_diffusion:
         noisy_dict = action_head.module.sample_noisy_actions(ground_truth_actions)
-        noise, noisy_actions, diffusion_timestep_embeddings = (
-            noisy_dict["noise"],
-            noisy_dict["noisy_actions"],
-            noisy_dict["diffusion_timestep_embeddings"],
-        )
+        noise = noisy_dict["noise"]
+        noisy_actions = noisy_dict["noisy_actions"]
+        diffusion_timestep_embeddings = noisy_dict["diffusion_timestep_embeddings"]
     else:
-        noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
+        noise = None
+        noisy_actions = None
+        diffusion_timestep_embeddings = None
 
-    # VLA forward pass
+    # ---- VLA forward ----
     with torch.autocast("cuda", dtype=torch.bfloat16):
         output: CausalLMOutputWithPast = vla(
-            input_ids=batch["input_ids"].to(device_id),
-            attention_mask=batch["attention_mask"].to(device_id),
-            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-            labels=batch["labels"],
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=batch["pixel_values"].to(device_id).to(torch.bfloat16),
+            labels=labels,
             output_hidden_states=True,
-            proprio=batch["proprio"] if use_proprio else None,
+            proprio=batch["proprio"].to(device_id) if use_proprio else None,
             proprio_projector=proprio_projector if use_proprio else None,
             noisy_actions=noisy_actions if use_diffusion else None,
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
@@ -346,14 +340,16 @@ def run_forward_pass(
             use_film=use_film,
         )
 
-    # Get action masks needed for logging
-    ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
+    # ---- Masks for discrete metrics (unchanged) ----
+    # These functions in OpenVLA expect ground_truth token ids aligned with predictions (labels[:, 1:])
+    ground_truth_token_ids = labels[:, 1:]  # (B, L-1), includes IGNORE_INDEX where not supervised
     current_action_mask = get_current_action_mask(ground_truth_token_ids)
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
 
-    # Compute metrics for discrete action representation (next-token prediction)
+    # ---- Discrete token prediction path ----
     if not (use_l1_regression or use_diffusion):
         loss = output.loss
+
         predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
         curr_action_accuracy = compute_token_accuracy(
             predicted_token_ids, ground_truth_token_ids, mask=current_action_mask
@@ -367,135 +363,113 @@ def run_forward_pass(
         next_actions_l1_loss = compute_actions_l1_loss(
             action_tokenizer, predicted_token_ids, ground_truth_token_ids, mask=next_actions_mask
         )
-        metrics.update(
-            {
-                "loss_value": loss.item(),  # Detached value for logging
-                "curr_action_accuracy": curr_action_accuracy.item(),
-                "curr_action_l1_loss": curr_action_l1_loss.item(),
-                "next_actions_accuracy": next_actions_accuracy.item(),
-                "next_actions_l1_loss": next_actions_l1_loss.item(),
-            }
-        )
-    # Compute metrics for continuous action representations (L1 regression | diffusion)
-    else:
-        # Get last layer hidden states
-        last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
-        # Get hidden states for text portion of prompt+response (after the vision patches)
-        text_hidden_states = last_hidden_states[:, num_patches:-1]
-        # Get hidden states for action portion of response
-        batch_size = batch["input_ids"].shape[0]
-        print("[DEBUG RF] action_logits shape before reshape:", text_hidden_states[current_action_mask | next_actions_mask].shape, flush=True)
-        print("[DEBUG RF] numel:", text_hidden_states[current_action_mask | next_actions_mask].numel(), "batch:", batch_size, flush=True)
-
-        # actions_hidden_states = (
-        #     text_hidden_states[current_action_mask | next_actions_mask]
-        #     .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
-        #     .to(torch.bfloat16)
-        # )  # (B, act_chunk_len, D)
-        # Get hidden states for action portion of response
-        batch_size = batch["input_ids"].shape[0]
-        action_mask = (current_action_mask | next_actions_mask)  # shape (B, S_text)
-
-        flat = text_hidden_states[action_mask]                   # shape (B*N, D) because mask flattens
-        D = flat.shape[-1]
-
-        # Convert back to per-batch sequences (assumes each example has same #masked tokens)
-        flat = flat.view(batch_size, -1, D)                      # (B, N_masked, D)
-
-        expected = NUM_ACTIONS_CHUNK * ACTION_DIM                # 40
-
-        # If the stop token is included, N_masked will be 41. Drop extras (usually last token).
-        if flat.shape[1] != expected:
-            print(f"[DEBUG RF] masked tokens per batch={flat.shape[1]}, expected={expected} (dropping extras)", flush=True)
-        flat = flat[:, :expected, :]                             # keep only first 40 tokens
-
-        actions_hidden_states = flat.to(torch.bfloat16)          # (B, 40, D)
-
-
-        if use_l1_regression:
-            # Predict action
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
-            # Get full L1 loss
-            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
-
-        if use_diffusion:
-            # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
-            # Get diffusion noise prediction MSE loss
-            noise_pred = noise_pred.reshape(noise.shape)
-            loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
-
-            # Only sample actions and compute L1 losses if specified
-            if compute_diffusion_l1:
-                with torch.no_grad():
-                    predicted_actions = run_diffusion_sampling(
-                        vla=vla,
-                        action_head=action_head,
-                        noisy_action_projector=noisy_action_projector,
-                        proprio_projector=proprio_projector,
-                        batch=batch,
-                        batch_size=batch_size,
-                        num_patches=num_patches,
-                        actions_shape=ground_truth_actions.shape,
-                        device_id=device_id,
-                        current_action_mask=current_action_mask,
-                        next_actions_mask=next_actions_mask,
-                        use_proprio=use_proprio,
-                        use_film=use_film,
-                    )
 
         metrics.update(
             {
-                "loss_value": loss.item(),  # Detached value for logging
+                "loss_value": float(loss.item()),
+                "curr_action_accuracy": float(curr_action_accuracy.item()),
+                "curr_action_l1_loss": float(curr_action_l1_loss.item()),
+                "next_actions_accuracy": float(next_actions_accuracy.item()),
+                "next_actions_l1_loss": float(next_actions_l1_loss.item()),
             }
         )
+        return loss, metrics
 
-        # Get detailed L1 losses for logging
-        should_log_l1_loss = not use_diffusion or (use_diffusion and compute_diffusion_l1)
-        if should_log_l1_loss:
-            ground_truth_curr_action = ground_truth_actions[:, 0]
-            predicted_curr_action = predicted_actions[:, 0]
-            ground_truth_next_actions = ground_truth_actions[:, 1:]
-            predicted_next_actions = predicted_actions[:, 1:]
-            curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
-            # next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
-            # --- L1 loss for next actions ---------------------------------
-            # predicted_next_actions: (B, N_pred, ACTION_DIM)
-            # ground_truth_next_actions: currently (B, T, N_gt, ACTION_DIM) or (B, N_gt, ACTION_DIM)
+    # ---- Continuous action paths (L1 regression / diffusion) ----
+    last_hidden_states = output.hidden_states[-1]  # (B, num_patches + L, D) in OpenVLA-style
+    # Align with labels[:,1:] just like the discrete path does with logits[:, num_patches:-1]
+    text_hidden_states = last_hidden_states[:, num_patches:-1]  # (B, L-1, D)
 
-            # 1) If GT has a time dimension, take t=0
-            if ground_truth_next_actions.dim() == 4:
-                # (B, T, N_gt, A) -> (B, N_gt, A), take first timestep
-                ground_truth_next_actions = ground_truth_next_actions[:, 0]
+    batch_size = input_ids.shape[0]
+    D = text_hidden_states.shape[-1]
+    expected_tokens = NUM_ACTIONS_CHUNK * ACTION_DIM  # 40 for 8*5
 
-            # 2) Align chunk dimension:
-            # In your logs: GT is (1, 8, 5), predicted is (1, 7, 5).
-            # Typically: chunk[0] is current, chunks[1:] are "next" actions.
-            if ground_truth_next_actions.shape[1] == predicted_next_actions.shape[1] + 1:
-                # Drop the "current" chunk from GT so we only compare future actions
-                ground_truth_next_actions = ground_truth_next_actions[:, 1:]
+    # Supervision mask = exactly positions where labels are not IGNORE (on the shifted axis)
+    sup_mask = ground_truth_token_ids.ne(IGNORE_INDEX)  # (B, L-1)
 
-            # 3) If predicted somehow has the extra chunk, drop it there instead
-            elif predicted_next_actions.shape[1] == ground_truth_next_actions.shape[1] + 1:
-                predicted_next_actions = predicted_next_actions[:, 1:]
+    # Drop EOS from regression features if it is supervised
+    eos_id = getattr(action_tokenizer.tokenizer, "eos_token_id", None)
+    # Use shifted input_ids (aligned with labels[:,1:])
+    shifted_input_ids = input_ids[:, 1:]
+    if eos_id is not None:
+        sup_mask = sup_mask & shifted_input_ids.ne(eos_id)
 
-            # 4) Final sanity check
-            assert ground_truth_next_actions.shape == predicted_next_actions.shape, \
-                f"GT next-actions shape {ground_truth_next_actions.shape} != predicted {predicted_next_actions.shape}"
-
-            # 5) L1 loss: predicted vs GT
-            next_actions_l1_loss = torch.nn.L1Loss()(predicted_next_actions, ground_truth_next_actions)
-
-            metrics.update(
-                {
-                    "curr_action_l1_loss": curr_action_l1_loss.item(),
-                    "next_actions_l1_loss": next_actions_l1_loss.item(),
-                }
+    # Gather per-batch to preserve order and avoid flattening surprises
+    action_hs_list = []
+    for b in range(batch_size):
+        hs_b = text_hidden_states[b][sup_mask[b]]  # (N_b, D)
+        if hs_b.shape[0] != expected_tokens:
+            # Print helpful debug once
+            n_b = int(hs_b.shape[0])
+            print(
+                f"[run_forward_pass] ERROR: supervised action tokens for batch {b} = {n_b}, "
+                f"expected {expected_tokens}. "
+                f"(eos_dropped={eos_id is not None}).",
+                flush=True,
             )
+            # Optional: show how many supervised tokens BEFORE eos-drop
+            pre = int(ground_truth_token_ids[b].ne(IGNORE_INDEX).sum().item())
+            print(f"[run_forward_pass] batch {b}: supervised tokens before eos-drop = {pre}", flush=True)
+            # Hard fail so you fix data/labels immediately
+            raise ValueError(
+                f"Supervised action token count mismatch: got {n_b}, expected {expected_tokens}."
+            )
+        action_hs_list.append(hs_b)
 
-    # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
+    actions_hidden_states = torch.stack(action_hs_list, dim=0).to(torch.bfloat16)  # (B, 40, D)
+
+    # --- L1 regression ---
+    if use_l1_regression:
+        predicted_actions = action_head.module.predict_action(actions_hidden_states)  # (B, 8, 5)
+        loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+
+    # --- Diffusion ---
+    if use_diffusion:
+        noise_pred = action_head.module.predict_noise(actions_hidden_states)
+        noise_pred = noise_pred.reshape(noise.shape)
+        loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
+
+        # Only sample actions and compute L1 losses if specified
+        if compute_diffusion_l1:
+            with torch.no_grad():
+                predicted_actions = run_diffusion_sampling(
+                    vla=vla,
+                    action_head=action_head,
+                    noisy_action_projector=noisy_action_projector,
+                    proprio_projector=proprio_projector,
+                    batch=batch,
+                    batch_size=batch_size,
+                    num_patches=num_patches,
+                    actions_shape=ground_truth_actions.shape,
+                    device_id=device_id,
+                    current_action_mask=current_action_mask,
+                    next_actions_mask=next_actions_mask,
+                    use_proprio=use_proprio,
+                    use_film=use_film,
+                )
+
+    metrics["loss_value"] = float(loss.item())
+
+    # Detailed L1 logging (only when predicted_actions exists)
+    should_log_l1_loss = (use_l1_regression) or (use_diffusion and compute_diffusion_l1)
+    if should_log_l1_loss:
+        # predicted_actions and ground_truth_actions expected (B, 8, 5)
+        gt_curr = ground_truth_actions[:, 0]
+        pr_curr = predicted_actions[:, 0]
+        gt_next = ground_truth_actions[:, 1:]
+        pr_next = predicted_actions[:, 1:]
+
+        curr_action_l1_loss = torch.nn.L1Loss()(gt_curr, pr_curr)
+        next_actions_l1_loss = torch.nn.L1Loss()(gt_next, pr_next)
+
+        metrics.update(
+            {
+                "curr_action_l1_loss": float(curr_action_l1_loss.item()),
+                "next_actions_l1_loss": float(next_actions_l1_loss.item()),
+            }
+        )
+
     return loss, metrics
-
 
 def run_diffusion_sampling(
     vla,
@@ -1092,37 +1066,14 @@ def finetune(cfg: FinetuneConfig) -> None:
     #     )
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
-        # This must match how we build action chunks in RLDSBatchTransform:
-        # we use 1 current + max_future_actions future actions.
-        max_future_actions = 10  # MUST match RLDSBatchTransform in datasets.py
-        chunk_len = 1 + max_future_actions  # 11 in your logs
-
-        # actions_hidden_states comes in with shape:
-        # (batch_size, chunk_len * ACTION_DIM, llm_dim)
-        # Then we reshape to (batch_size, NUM_ACTIONS_CHUNK, -1),
-        # so the flattened per-chunk dim is:
-        #   flattened_dim = chunk_len * ACTION_DIM * llm_dim / NUM_ACTIONS_CHUNK
-        llm_dim = vla.module.llm_dim
-        flattened_dim = (chunk_len * ACTION_DIM * llm_dim) // NUM_ACTIONS_CHUNK
-
-        # L1RegressionActionHead expects input_dim * ACTION_DIM = flattened_dim
-        input_dim_for_head = flattened_dim // ACTION_DIM  # 5632 in your current setup
-
-        print(
-            f"[DEBUG ACTION_HEAD INIT] llm_dim={llm_dim}, ACTION_DIM={ACTION_DIM}, "
-            f"chunk_len={chunk_len}, NUM_ACTIONS_CHUNK={NUM_ACTIONS_CHUNK}, "
-            f"flattened_dim={flattened_dim}, input_dim_for_head={input_dim_for_head}",
-            flush=True,
-        )
-
         action_head = init_module(
             L1RegressionActionHead,
             "action_head",
             cfg,
             device_id,
             {
-                "input_dim": input_dim_for_head,   # 5632 for your current config
-                "hidden_dim": llm_dim,             # internal MLP hidden size
+                "input_dim": vla.module.llm_dim,   # 4096
+                "hidden_dim": vla.module.llm_dim,  
                 "action_dim": ACTION_DIM,          # 5-DoF
             },
             to_bf16=True,

@@ -51,18 +51,11 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
 
     # Truncate other elements of the trajectory dict
     traj["task"] = tf.nest.map_structure(lambda x: tf.gather(x, tf.range(effective_traj_len)), traj["task"])
-    # traj["dataset_name"] = tf.gather(traj["dataset_name"], tf.range(effective_traj_len))
-    # dataset_name is constant for the whole trajectory; we don't actually need it per-timestep.
-    
-    # Make sure it's a scalar string (take the first element if it's a vector),
-    # and avoid gathering over time to prevent rank/shape issues.
-    # ds_name = traj["dataset_name"]
-    # if tf.rank(ds_name) > 0:
-    #     # e.g. original OXE RLDS: shape [T] with the same string repeated
-    #     ds_name = ds_name[0]
-    # traj["dataset_name"] = ds_name
 
-    traj["absolute_action_mask"] = tf.gather(traj["absolute_action_mask"], tf.range(effective_traj_len))
+    abs_mask = traj["absolute_action_mask"]
+    if abs_mask.shape.rank == 1:
+        abs_mask = abs_mask[:, None]
+    traj["absolute_action_mask"] = tf.gather(abs_mask, tf.range(effective_traj_len))
 
     return traj
 

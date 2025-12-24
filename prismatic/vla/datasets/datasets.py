@@ -147,9 +147,9 @@ class RLDSBatchTransform:
         dataset_name = rlds_batch["dataset_name"]
         
         # FIX: Convert float32 images to uint8 for PIL
-        image_primary_data = rlds_batch["observation"]["image_primary"][0]
-        if image_primary_data.dtype == np.float32:
-            image_primary_data = (image_primary_data * 255).astype(np.uint8)
+        image_primary_data = rlds_batch["observation"]["image_primary"]
+        if isinstance(image_primary_data, np.ndarray) and image_primary_data.ndim == 4:
+            image_primary_data = image_primary_data[-1]  # current frame
         img = Image.fromarray(image_primary_data)
         
         # FIX: Handle language instruction
@@ -160,11 +160,14 @@ class RLDSBatchTransform:
             lang = lang_instruction[0].decode().lower() if isinstance(lang_instruction, np.ndarray) else str(lang_instruction).lower()
         
         actions = rlds_batch["action"]
-        print(f"[DEBUG] Actions shape: {actions.shape}, dtype: {actions.dtype}", flush=True)
-        test_action = actions[0, 0]
-        tokenized_test = self.action_tokenizer(test_action)
-        print(f"[DEBUG ACTION TOKENIZER] Single action tokens: '{tokenized_test}'", flush=True)
-        print(f"[DEBUG ACTION TOKENIZER] Single action token length: {len(tokenized_test)}", flush=True)
+        # Expected after chunking + frame sampling:
+        # actions: (NUM_ACTIONS_CHUNK, ACTION_DIM)  e.g. (8,5)
+        # Some pipelines might keep an extra leading window dim -> (window, 8, 5)
+        if isinstance(actions, np.ndarray) and actions.ndim == 3:
+            actions = actions[-1]  # take current frame (last in window)
+        if not (isinstance(actions, np.ndarray) and actions.ndim == 2):
+            raise ValueError(f"Expected actions rank-2 (8,5), got shape {getattr(actions,'shape',None)}")
+        action_chunk = actions[:NUM_ACTIONS_CHUNK]  # ensure (8,5)
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
@@ -176,24 +179,10 @@ class RLDSBatchTransform:
         max_future_actions = 10  # Limit to prevent sequence overflow
         future_actions = actions[1:1+max_future_actions, 0]  # Shape: (max_future_actions, 5)
         print(f"[DEBUG] Limited future actions shape: {future_actions.shape}", flush=True)
-
-        # # FIX: Tokenize actions properly
-        # try:
-        #     current_action_string = self.action_tokenizer(current_action)
-        #     future_actions_string = ''.join([self.action_tokenizer(action) for action in future_actions])
-        # except Exception as e:
-        #     print(f"[ERROR] Action tokenizer failed: {e}", flush=True)
-        #     current_action_string = ''
-        #     future_actions_string = ''
-
-        # action_chunk_string = current_action_string + future_actions_string
-        # action_chunk_len = len(action_chunk_string)
         
-        # action_chunk: (NUM_ACTIONS_CHUNK, ACTION_DIM)
-        action_chunk = actions[0]
-
-        # NEW: stable token ids, length exactly NUM_ACTIONS_CHUNK * ACTION_DIM (=40)
+        # Stable token ids: length exactly NUM_ACTIONS_CHUNK * ACTION_DIM (=40)
         action_token_ids = self.action_tokenizer.encode_chunk_to_token_ids(action_chunk)
+        
         assert len(action_token_ids) == NUM_ACTIONS_CHUNK * ACTION_DIM, \
             f"Expected {NUM_ACTIONS_CHUNK*ACTION_DIM} action token ids, got {len(action_token_ids)}"
 
@@ -225,23 +214,21 @@ class RLDSBatchTransform:
         if not self.predict_stop_token and eos is not None:
             labels[-1] = IGNORE_INDEX
 
-        input_ids = torch.tensor(input_ids)
-        labels = torch.tensor(labels)
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
 
 
         print(f"[DEBUG TOKENS] Total input IDs length: {len(input_ids)}", flush=True)
         print(f"[DEBUG TOKENS] Base tokenizer vocab size: {self.base_tokenizer.vocab_size}", flush=True)
 
-        # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
-        input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
         pixel_values = self.image_transform(img)
-
-        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(action_chunk_token_len + 1)] = IGNORE_INDEX
-        if not self.predict_stop_token:
-            labels[-1] = IGNORE_INDEX
-
-        return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            labels=labels,
+            dataset_name=dataset_name,
+            actions=action_chunk,   # store chunk used for regression
+        )
 
         if self.use_wrist_image:
             all_wrist_pixels = []
@@ -258,21 +245,28 @@ class RLDSBatchTransform:
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             print(f"[DEBUG] Proprio shape: {proprio.shape}, dtype: {proprio.dtype}", flush=True)
-            
-            # Take the first timestep and first chunk
-            if len(proprio.shape) == 3:
-                proprio_processed = proprio[0, 0]
+
+            # RLDS chunking makes obs shaped like:
+            # - (window, PROPRIO_DIM)  OR
+            # - (window, 1, PROPRIO_DIM)  OR
+            # - (window, k, PROPRIO_DIM) in some forks
+            # We always want the *current* frame => last index in window dimension.
+            if isinstance(proprio, np.ndarray):
+                if proprio.ndim == 3:
+                    proprio_processed = proprio[-1, 0]   # current frame, first sub-dim
+                elif proprio.ndim == 2:
+                    proprio_processed = proprio[-1]      # current frame
+                elif proprio.ndim == 1:
+                    proprio_processed = proprio          # already a vector
+                else:
+                    raise ValueError(f"Unsupported proprio shape: {proprio.shape}")
             else:
-                proprio_processed = proprio[0]
-            
+                # if somehow not numpy, fallback
+                proprio_processed = proprio
+
             proprio_tensor = torch.tensor(proprio_processed, dtype=torch.float32).unsqueeze(0)
             print(f"[DEBUG] Final proprio shape for model: {proprio_tensor.shape}", flush=True)
             return_dict["proprio"] = proprio_tensor
-
-        print(f"[DEBUG TOKENS] Input IDs length: {len(input_ids)}", flush=True)
-        print(f"[DEBUG TOKENS] Action chunk string length: {len(action_chunk_string)}", flush=True)
-        print(f"[DEBUG TOKENS] Action chunk tokens: {action_chunk_string}", flush=True)
-        print("[DEBUG TOKENS] action_chunk_token_len:", action_chunk_token_len, flush=True)
 
         return return_dict
 

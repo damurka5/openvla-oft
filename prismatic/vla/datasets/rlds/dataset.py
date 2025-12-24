@@ -334,7 +334,7 @@ def make_dataset_from_rlds(
         return traj
 
     builder = tfds.builder(name, data_dir=data_dir)
-    dataset = _ensure_dldataset(dataset)
+
     # load or compute dataset statistics
     if isinstance(dataset_statistics, str):
         with tf.io.gfile.GFile(dataset_statistics, "r") as f:
@@ -406,9 +406,10 @@ def apply_trajectory_transforms(
     
     import tensorflow as tf
     def _ensure_abs_mask(traj):
-        # traj is a dict of tensors; create [T] boolean mask
         T = tf.shape(traj["action"])[0]
-        traj["absolute_action_mask"] = tf.ones([T], dtype=tf.bool)
+        A = tf.shape(traj["action"])[-1]
+        # Most robots use relative actions => absolute mask = False
+        traj["absolute_action_mask"] = tf.zeros([T, A], dtype=tf.bool)
         return traj
 
     dataset = dataset.traj_map(_ensure_abs_mask, num_parallel_calls)
@@ -421,26 +422,6 @@ def apply_trajectory_transforms(
         sig = tf.TensorSpec(shape=(), dtype=tf.float32)
         dataset = dl.DLataset.from_generator(_gen, output_signature=sig)
         
-    def _ensure_dl(ds):
-        """Make sure `ds` is a dlimp.DLataset`, even if it's a tf.data.Dataset or iterator."""
-        if hasattr(ds, "traj_map") and hasattr(ds, "frame_map"):
-            return ds  # already a DLataset
-
-        # --- safest universal path ---
-        def _yield_items():
-            for x in ds:
-                yield x
-
-        # build minimal output_signature
-        # (use a permissive 'object' dtype to avoid TF shape inference issues)
-        signature = tf.TensorSpec(shape=(), dtype=tf.float32)
-
-        try:
-            return dl.DLataset.from_generator(_yield_items, output_signature=signature)
-        except Exception:
-            # fallback: just materialize if generator wrapping fails
-            return dl.DLataset.from_generator(lambda: list(ds), output_signature=signature)
-
     # force-disable the problematic branch and coerce type up front
     skip_unlabeled = False
     dataset = _ensure_dldataset(dataset)
@@ -516,45 +497,47 @@ def apply_per_dataset_frame_transforms(
     return dataset
 
 def custom_decode_and_resize(obs, resize_size=None):
-    """Custom decode function that handles batched image data"""
     if resize_size is None:
         resize_size = {}
-    
-    print(f"[DEBUG CUSTOM DECODE] Input obs keys: {list(obs.keys())}", flush=True)
-    
-    # Handle different image keys
+
     image_keys = ["image_primary", "image_wrist"]
-    
-    for key in image_keys:
-        if key in obs and obs[key] is not None:
-            print(f"[DEBUG CUSTOM DECODE] Processing {key}, shape: {obs[key].shape}, dtype: {obs[key].dtype}", flush=True)
-            
-            # The images are batched, so we need to decode each one individually
-            # Shape: [batch_size, 1] where each element is encoded image bytes
-            
-            def decode_single_image(encoded_image):
-                """Decode a single image from bytes"""
-                # Remove the extra dimension and decode
-                image_bytes = tf.reshape(encoded_image, [])
-                image = tf.io.decode_image(image_bytes, channels=3, expand_animations=False)
-                image = tf.cast(image, tf.float32) / 255.0
-                
-                # Resize if specified
-                if key in resize_size:
-                    image = tf.image.resize(image, resize_size[key], method="lanczos3", antialias=True)
-                
-                return image
-            
-            # Apply decoding to each image in the batch
-            decoded_images = tf.map_fn(
-                decode_single_image,
-                obs[key],
-                fn_output_signature=tf.TensorSpec(shape=(None, None, 3), dtype=tf.float32)
-            )
-            
-            print(f"[DEBUG CUSTOM DECODE] {key} decoded shape: {decoded_images.shape}", flush=True)
-            obs[key] = decoded_images
-    
+
+    def _decode_one(encoded, size_hw):
+        encoded = tf.reshape(encoded, [])  # scalar string
+        img = tf.io.decode_image(encoded, channels=3, expand_animations=False)
+        img = tf.image.convert_image_dtype(img, tf.float32)
+        if size_hw is not None:
+            img = tf.image.resize(img, size_hw, method="lanczos3", antialias=True)
+            img.set_shape([size_hw[0], size_hw[1], 3])
+        return img
+
+    for k in image_keys:
+        if k not in obs or obs[k] is None:
+            continue
+        if obs[k].dtype != tf.string:
+            continue  # already decoded
+
+        t = obs[k]
+        # accept (K,) or (K,1)
+        if t.shape.rank == 2 and t.shape[-1] == 1:
+            t = tf.reshape(t, [-1])
+        elif t.shape.rank == 1:
+            pass
+        else:
+            # if someone already decoded, it won't be tf.string
+            t = tf.reshape(t, [-1])
+
+        size = resize_size.get(k, None)
+        decoded = tf.map_fn(
+            lambda x: _decode_one(x, size),
+            t,
+            fn_output_signature=tf.TensorSpec(
+                shape=(size[0], size[1], 3) if size is not None else (None, None, 3),
+                dtype=tf.float32,
+            ),
+        )
+        obs[k] = decoded
+
     return obs
 
 def apply_frame_transforms(dataset, resize_size=(224, 224), num_parallel_calls=None, train=True):
@@ -583,7 +566,7 @@ def apply_frame_transforms(dataset, resize_size=(224, 224), num_parallel_calls=N
         for key in image_keys:
             if key in obs and obs[key] is not None:
                 # If image has rank 2 ([batch, 1]), it needs decoding
-                if len(obs[key].shape) == 2 and obs[key].shape[-1] == 1:
+                if obs[key].dtype == tf.string:
                     needs_processing = True
                     break
         

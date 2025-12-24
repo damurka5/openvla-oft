@@ -2,64 +2,67 @@
 
 import torch
 
-from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX
+from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK
 
+def get_current_action_mask(labels: torch.Tensor) -> torch.Tensor:
+    """
+    Returns a boolean mask over `labels` (shape [B, L]) selecting ONLY the
+    first ACTION_DIM supervised action tokens per example.
 
-# def get_current_action_mask(token_ids):
-#     # Create a tensor marking positions of IGNORE_INDEX
-#     newline_positions = token_ids != IGNORE_INDEX
-
-#     # Calculate cumulative sum to identify regions between newlines
-#     cumsum = torch.cumsum(newline_positions, dim=1)
-
-#     # Create the mask
-#     mask = (1 <= cumsum) & (cumsum <= ACTION_DIM)
-
-#     # Extract the action part only
-#     action_tokens_only_mask = token_ids > ACTION_TOKEN_BEGIN_IDX
-#     mask = action_tokens_only_mask * mask
-
-#     return mask
-def get_current_action_mask(labels):
-    # Handle None case for inference
+    Works with any tokenizer and any action-token id scheme.
+    """
     if labels is None:
-        # Return a dummy mask - the shape doesn't matter since it won't be used
         return None
-    
-    batch_size, seq_len = labels.shape
-    
-    # Find newline positions (token_id = 13)
-    newline_positions = (labels == 13)
-    
-    # Convert bool to int before cumsum
-    if newline_positions.dtype == torch.bool:
-        newline_positions = newline_positions.to(torch.int64)
-    
-    # Compute cumulative sum
-    cumsum = torch.cumsum(newline_positions, dim=1)
-    
-    # Create mask where cumulative sum is even (after each pair of newlines)
-    current_action_mask = (cumsum % 2 == 0) & (labels != -100)
-    
-    # Ensure mask is boolean
-    return current_action_mask.bool()
 
-def get_next_actions_mask(token_ids):
-    # Create a tensor marking positions of IGNORE_INDEX
-    newline_positions = token_ids != IGNORE_INDEX
+    B, L = labels.shape
+    mask = torch.zeros((B, L), dtype=torch.bool, device=labels.device)
 
-    # Calculate cumulative sum to identify regions between newlines
-    cumsum = torch.cumsum(newline_positions, dim=1)
+    expected_total = NUM_ACTIONS_CHUNK * ACTION_DIM  # e.g. 40
 
-    # Create the mask
-    mask = cumsum > ACTION_DIM
+    for b in range(B):
+        pos = torch.nonzero(labels[b] != IGNORE_INDEX, as_tuple=False).squeeze(1)
 
-    # Extract the action part only
-    action_tokens_only_mask = token_ids > ACTION_TOKEN_BEGIN_IDX
-    mask = action_tokens_only_mask * mask
+        # If EOS is also supervised, pos might be 41. Keep only the first expected_total.
+        if pos.numel() > expected_total:
+            pos = pos[:expected_total]
+
+        # Current action = first ACTION_DIM tokens (if available)
+        if pos.numel() > 0:
+            cur = pos[: min(ACTION_DIM, pos.numel())]
+            mask[b, cur] = True
 
     return mask
 
+
+def get_next_actions_mask(labels: torch.Tensor) -> torch.Tensor:
+    """
+    Returns a boolean mask over `labels` (shape [B, L]) selecting the
+    supervised tokens AFTER the first ACTION_DIM action tokens per example,
+    up to NUM_ACTIONS_CHUNK*ACTION_DIM total tokens.
+
+    Works with any tokenizer and any action-token id scheme.
+    """
+    if labels is None:
+        return None
+
+    B, L = labels.shape
+    mask = torch.zeros((B, L), dtype=torch.bool, device=labels.device)
+
+    expected_total = NUM_ACTIONS_CHUNK * ACTION_DIM  # e.g. 40
+
+    for b in range(B):
+        pos = torch.nonzero(labels[b] != IGNORE_INDEX, as_tuple=False).squeeze(1)
+
+        # If EOS is supervised, pos might be 41. Keep only first expected_total.
+        if pos.numel() > expected_total:
+            pos = pos[:expected_total]
+
+        # Next actions = everything after the first ACTION_DIM tokens
+        if pos.numel() > ACTION_DIM:
+            nxt = pos[ACTION_DIM:]
+            mask[b, nxt] = True
+
+    return mask
 
 def compute_token_accuracy(predicted_token_ids, ground_truth_token_ids, mask):
     correct_preds = (predicted_token_ids == ground_truth_token_ids) & mask

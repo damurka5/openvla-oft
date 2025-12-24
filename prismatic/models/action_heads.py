@@ -128,6 +128,13 @@ class L1RegressionActionHead(nn.Module):
     f"Hidden size mismatch: got {actions_hidden_states.shape[-1]}, expected {self.input_dim}"
 
         B = actions_hidden_states.shape[0]
+        expected_tokens = NUM_ACTIONS_CHUNK * ACTION_DIM
+        if actions_hidden_states.shape[1] != expected_tokens:
+            raise ValueError(
+                f"Expected {expected_tokens} action tokens (NUM_ACTIONS_CHUNK*ACTION_DIM), "
+                f"got {actions_hidden_states.shape[1]}. "
+                "Fix extraction to use labels!=IGNORE_INDEX and exclude EOS."
+            )
         # (B, 40, 4096) -> (B, 8, 5, 4096) -> (B, 8, 20480)
         x = actions_hidden_states.view(B, NUM_ACTIONS_CHUNK, ACTION_DIM, self.input_dim)
         x = x.reshape(B, NUM_ACTIONS_CHUNK, ACTION_DIM * self.input_dim)
