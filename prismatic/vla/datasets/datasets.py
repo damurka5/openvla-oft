@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple, Type
 
 import numpy as np
+import io
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
@@ -85,72 +86,73 @@ class RLDSBatchTransform:
     use_wrist_image: bool = False
     use_proprio: bool = False
 
-#     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
-#         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-#         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-#         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
-#         lang = rlds_batch["task"]["language_instruction"].decode().lower()
-#         actions = rlds_batch["action"]
+    def _to_pil_rgb(self, x: np.ndarray) -> Image.Image:
+        """
+        Convert image data (possibly float32, possibly with extra dims) into a PIL RGB image.
+        Handles:
+        - bytes/np.bytes_ (encoded images)
+        - float32/float64 in [0,1] or [0,255]
+        - uint8
+        - shapes: (H,W,3), (T,H,W,3), (B,T,H,W,3), (B,H,W,3), plus singleton dims
+        """
+        # --- encoded bytes case ---
+        if isinstance(x, (bytes, np.bytes_)):
+            return Image.open(io.BytesIO(x)).convert("RGB")
 
-#         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
-#         prompt_builder = self.prompt_builder_fn("openvla")
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x)
 
-#         # Get future action chunk
-#         future_actions = rlds_batch["action"][1:]
-#         future_actions_string = ''.join(self.action_tokenizer(future_actions))
+        # If object array of bytes (common when coming from TFRecords)
+        if x.dtype == object:
+            # pick a scalar element
+            x0 = x
+            while isinstance(x0, np.ndarray) and x0.dtype == object:
+                x0 = x0[0]
+            if isinstance(x0, (bytes, np.bytes_)):
+                return Image.open(io.BytesIO(x0)).convert("RGB")
+            x = np.asarray(x0)
 
-#         # Get action chunk string
-#         current_action_string = self.action_tokenizer(current_action)
-#         action_chunk_string = current_action_string + future_actions_string
-#         action_chunk_len = len(action_chunk_string)
+        # --- peel extra leading dims deterministically ---
+        # prefer "current frame" for time/window dims and first for batch dims
+        if x.ndim == 5:         # (B, T, H, W, C)
+            x = x[0, -1]
+        elif x.ndim == 4:       # (T, H, W, C) or (B, H, W, C)
+            # heuristic: if last dim is 3, treat as images; pick last along first axis (current frame)
+            x = x[-1] if x.shape[-1] == 3 else x[0]
+        elif x.ndim > 5:
+            # squeeze then retry
+            x = np.squeeze(x)
+            if x.ndim == 5:
+                x = x[0, -1]
+            elif x.ndim == 4:
+                x = x[-1]
 
-#         conversation = [
-#             {"from": "human", "value": f"What action should the robot take to {lang}?"},
-#             {"from": "gpt", "value": action_chunk_string},
-#         ]
-#         for turn in conversation:
-#             prompt_builder.add_turn(turn["from"], turn["value"])
+        # Squeeze any leftover singleton dims (can cause (1,1,3))
+        x = np.squeeze(x)
 
-#         # Tokenize (w/ `base_tokenizer`)
-#         input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
-#         labels = list(input_ids)
+        if x.ndim != 3 or x.shape[-1] != 3:
+            raise ValueError(f"Expected image shape (H,W,3) after squeezing, got {x.shape}, dtype={x.dtype}")
 
-#         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
-#         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
-#         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
-#         pixel_values = self.image_transform(img)
+        # --- dtype conversion to uint8 ---
+        if x.dtype != np.uint8:
+            x = x.astype(np.float32)
+            # if normalized [0,1], scale up
+            if np.nanmax(x) <= 1.5:
+                x = x * 255.0
+            x = np.clip(x, 0.0, 255.0).astype(np.uint8)
 
-#         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-#         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
-#         if not self.predict_stop_token:
-#             labels[-1] = IGNORE_INDEX
-
-#         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
-
-#         # Add additional inputs
-#         if self.use_wrist_image:
-#             all_wrist_pixels = []
-#             for k in rlds_batch["observation"].keys():
-#                 if "wrist" in k:
-#                     img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
-#                     pixel_values_wrist = self.image_transform(img_wrist)
-#                     all_wrist_pixels.append(pixel_values_wrist)
-#             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
-#         if self.use_proprio and "proprio" in rlds_batch["observation"]:
-#             proprio = rlds_batch["observation"]["proprio"]
-#             return_dict["proprio"] = proprio
-
-#         return return_dict
+        return Image.fromarray(x, mode="RGB")
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name = rlds_batch["dataset_name"]
         
-        # FIX: Convert float32 images to uint8 for PIL
-        image_primary_data = rlds_batch["observation"]["image_primary"]
-        if isinstance(image_primary_data, np.ndarray) and image_primary_data.ndim == 4:
-            image_primary_data = image_primary_data[-1]  # current frame
-        img = Image.fromarray(image_primary_data)
+        print(f'[DEBUG] rlds_batch info: {rlds_batch["observation"]["image_primary"].shape}, {rlds_batch["observation"]["image_primary"].dtype}')
+        
+        image_primary_raw = rlds_batch["observation"]["image_primary"]
+        if isinstance(image_primary_raw, np.ndarray) and image_primary_raw.ndim == 4:
+            image_primary_raw = image_primary_raw[-1]  # current frame
+        img = self._to_pil_rgb(image_primary_raw)
         
         # FIX: Handle language instruction
         lang_instruction = rlds_batch["task"]["language_instruction"]
@@ -174,11 +176,6 @@ class RLDSBatchTransform:
 
         # FIX: Use only the first action chunk from the first timestep
         current_action = actions[0, 0]  # Shape: (5,) - single action
-        
-        # FIX: Limit future actions to prevent sequence from being too long
-        max_future_actions = 10  # Limit to prevent sequence overflow
-        future_actions = actions[1:1+max_future_actions, 0]  # Shape: (max_future_actions, 5)
-        print(f"[DEBUG] Limited future actions shape: {future_actions.shape}", flush=True)
         
         # Stable token ids: length exactly NUM_ACTIONS_CHUNK * ACTION_DIM (=40)
         action_token_ids = self.action_tokenizer.encode_chunk_to_token_ids(action_chunk)
@@ -234,39 +231,34 @@ class RLDSBatchTransform:
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
                 if "wrist" in k:
-                    wrist_image_data = rlds_batch["observation"][k][0]
-                    if wrist_image_data.dtype == np.float32:
-                        wrist_image_data = (wrist_image_data * 255).astype(np.uint8)
-                    img_wrist = Image.fromarray(wrist_image_data)
+                    wrist_raw = rlds_batch["observation"][k]
+                    img_wrist = self._to_pil_rgb(wrist_raw)
+
                     pixel_values_wrist = self.image_transform(img_wrist)
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
         
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
-            print(f"[DEBUG] Proprio shape: {proprio.shape}, dtype: {proprio.dtype}", flush=True)
 
-            # RLDS chunking makes obs shaped like:
-            # - (window, PROPRIO_DIM)  OR
-            # - (window, 1, PROPRIO_DIM)  OR
-            # - (window, k, PROPRIO_DIM) in some forks
-            # We always want the *current* frame => last index in window dimension.
             if isinstance(proprio, np.ndarray):
-                if proprio.ndim == 3:
-                    proprio_processed = proprio[-1, 0]   # current frame, first sub-dim
+                # likely shapes: (window, P) or (B, window, P) or (B, window, 1, P)
+                if proprio.ndim == 4:
+                    proprio_processed = proprio[0, -1, 0]   # (P,)
+                elif proprio.ndim == 3:
+                    proprio_processed = proprio[-1, 0] if proprio.shape[1] == 1 else proprio[-1]
                 elif proprio.ndim == 2:
-                    proprio_processed = proprio[-1]      # current frame
+                    proprio_processed = proprio[-1]
                 elif proprio.ndim == 1:
-                    proprio_processed = proprio          # already a vector
+                    proprio_processed = proprio
                 else:
                     raise ValueError(f"Unsupported proprio shape: {proprio.shape}")
             else:
-                # if somehow not numpy, fallback
                 proprio_processed = proprio
 
-            proprio_tensor = torch.tensor(proprio_processed, dtype=torch.float32).unsqueeze(0)
-            print(f"[DEBUG] Final proprio shape for model: {proprio_tensor.shape}", flush=True)
+            proprio_tensor = torch.tensor(proprio_processed, dtype=torch.float32).unsqueeze(0)  # (1,5)
             return_dict["proprio"] = proprio_tensor
+            print(f"[DEBUG] Final proprio shape for model: {return_dict['proprio'].shape}", flush=True)
 
         return return_dict
 

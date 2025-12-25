@@ -59,6 +59,7 @@ from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
+    IGNORE_INDEX
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
@@ -1003,9 +1004,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-    ).to(device_id)
+    )
     
-    replace_action_head_if_shape_mismatch(vla)
+    # replace_action_head_if_shape_mismatch(vla) # no need 
+    
+    vla = vla.to(device_id)
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -1016,11 +1019,20 @@ def finetune(cfg: FinetuneConfig) -> None:
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
             lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
+            target_modules=[  # use your explicit list here
+                "q_proj","k_proj","v_proj","o_proj",
+                "gate_proj","up_proj","down_proj",
+                "qkv","proj","fc1","fc2",
+            ],
             init_lora_weights="gaussian",
         )
         vla = get_peft_model(vla, lora_config)
+
+        # IMPORTANT: LoRA params can be created on CPU -> move again
+        vla = vla.to(device_id)
+
         vla.print_trainable_parameters()
+
 
     # FiLM setup
     if cfg.use_film:
@@ -1268,6 +1280,17 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
+            
+            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+
+            if tb_writer is not None and gradient_step_idx % cfg.wandb_log_freq == 0:
+                # Log loss + other metrics
+                log_metrics_to_tensorboard(smoothened_metrics, "VLA Train", log_step, tb_writer)
+
+                # Log LR too (keep what you already had)
+                tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
+                tb_writer.flush()
+
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
