@@ -68,11 +68,12 @@ def main() -> int:
     # ---------- User-configurable via env ----------
     # Absolute or relative path where your dataset lives INSIDE the pod.
     # Example: /workspace/data/cdpr_human_control_only
-    data_root = os.environ.get("DATA_ROOT_DIR", "").strip()
-    if not data_root:
-        print("ERROR: Set DATA_ROOT_DIR to your dataset folder inside the pod.", flush=True)
-        print("Example: export DATA_ROOT_DIR=/workspace/data/cdpr_human_control_only", flush=True)
-        return 2
+    # data_root = os.environ.get("DATA_ROOT_DIR", "").strip()
+    # if not data_root:
+    #     print("ERROR: Set DATA_ROOT_DIR to your dataset folder inside the pod.", flush=True)
+    #     print("Example: export DATA_ROOT_DIR=/workspace/data/cdpr_human_control_only", flush=True)
+    #     return 2
+    data_root = os.environ.get("DATA_ROOT_DIR", "/root/repo/tfrecords_human_control").strip()
 
     # Repo root inside the pod (directory that contains vla-scripts/finetune.py)
     repo_root = Path(os.environ.get("REPO_ROOT", ".")).resolve()
