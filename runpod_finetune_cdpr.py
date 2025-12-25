@@ -92,7 +92,7 @@ def main() -> int:
     tb_port = int(os.environ.get("TENSORBOARD_PORT", "6006"))
 
     # Training knobs
-    max_steps = os.environ.get("MAX_STEPS", "100")
+    max_steps = os.environ.get("MAX_STEPS", "2000") # 100 for test, 10_000
     batch_size = os.environ.get("BATCH_SIZE", "1")
     lr = os.environ.get("LEARNING_RATE", "1e-4")
     num_images = os.environ.get("NUM_IMAGES_IN_INPUT", "2")
