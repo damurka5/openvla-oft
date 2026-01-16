@@ -713,7 +713,7 @@ OXE_DATASET_CONFIGS = {
 OXE_DATASET_CONFIGS["cdpr_local"] = {
     "name": "cdpr_local",
     "tfrecord_globs": [
-        "/root/repo/CDPR_Dataset/cdpr_dataset/datasets/cdpr_synth/libero_spatial_no_noops/tfrecords/libero_spatial_no_noops-train-*.tfrecord",
+        "/root/repo/cdpr_synth_10hz/libero_spatial_no_noops/tfrecords_human_control/libero_spatial_no_noops-train-*.tfrecord",
     ],
     "image_obs_keys": {
         "primary": "image_primary",

@@ -72,6 +72,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import sys
 print("DEBUG argv from finetune.py:", sys.argv, flush=True)
 
+def is_rank0():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return int(os.environ.get("RANK", "0")) == 0
 
 @dataclass
 class FinetuneConfig:
@@ -909,16 +913,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
-    # clearml_task = Task.current_task() if Task is not None else None
-
-    # if clearml_task is None and Task is not None:
-    #     clearml_task = Task.init(
-    #         project_name="CDPR",
-    #         task_name="openvla-7b-oft-cdpr-a100",
-    #     )
-
-    # logger = clearml_task.get_logger() if clearml_task is not None else None
-
+    nvml_handle = None
+    if is_rank0():
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+            print("[NVML] enabled", flush=True)
+        except Exception as e:
+            print(f"[NVML] disabled: {e}", flush=True)
+            nvml_handle = None
     
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
@@ -942,18 +946,18 @@ def finetune(cfg: FinetuneConfig) -> None:
     torch.cuda.set_device(device_id)
     torch.cuda.empty_cache()
 
+    # Create a simple dummy logger for compatibility
+    class DummyLogger:
+        def log(self, *args, **kwargs):
+            pass
+        def finish(self, *args, **kwargs):
+            pass
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+        
     if distributed_state.is_main_process:
         # Disable wandb completely
         os.environ["WANDB_DISABLED"] = "true"
-        
-        # Create a simple dummy logger for compatibility
-        class DummyLogger:
-            def log(self, *args, **kwargs):
-                pass
-            def finish(self, *args, **kwargs):
-                pass
-            def __getattr__(self, name):
-                return lambda *args, **kwargs: None
         
         wandb = DummyLogger()
     else:
@@ -1230,18 +1234,15 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
-    # tb_log_dir = "./VLA_CDPR/oft_cdpr_ckpts"
-    # if os.path.exists(tb_log_dir):
-    #     tb_thread = start_tensorboard(tb_log_dir)
-        
-    if distributed_state.is_main_process:
-        tb_writer = SummaryWriter(log_dir=str(run_dir))
-        print(f"[TensorBoard] Logging to: {run_dir}")
-    else:
-        tb_writer = None
+    tb_writer = None
+    if is_rank0():
+        tb_logdir = Path(run_dir)  # log directly into run_dir
+        tb_logdir.mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=str(tb_logdir), flush_secs=10)
+        print(f"[TensorBoard] Writing events to: {tb_logdir}", flush=True)
         
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    with tqdm.tqdm(total=cfg.max_steps, leave=False, disable=not is_rank0()) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -1282,26 +1283,26 @@ def finetune(cfg: FinetuneConfig) -> None:
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
             
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            
+            # CHECKER
+            if is_rank0() and gradient_step_idx == 0:
+                print(f"[TensorBoard] tb_writer is {'set' if tb_writer else 'None'}", flush=True)
 
-            if tb_writer is not None and gradient_step_idx % cfg.wandb_log_freq == 0:
+
+            if is_rank0() and tb_writer is not None and gradient_step_idx % cfg.wandb_log_freq == 0:
                 # Log loss + other metrics
                 log_metrics_to_tensorboard(smoothened_metrics, "VLA Train", log_step, tb_writer)
 
                 # Log LR too (keep what you already had)
-                tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
+                # tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
+                allocated_gb = torch.cuda.memory_allocated() / 1024**3
+                reserved_gb  = torch.cuda.memory_reserved() / 1024**3
+                max_alloc_gb = torch.cuda.max_memory_allocated() / 1024**3
+
+                tb_writer.add_scalar("cuda/mem_allocated_gb", allocated_gb, log_step)
+                tb_writer.add_scalar("cuda/mem_reserved_gb",  reserved_gb,  log_step)
+                tb_writer.add_scalar("cuda/max_allocated_gb", max_alloc_gb, log_step)
                 tb_writer.flush()
-
-
-            # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-            # if tb_writer is not None and log_step % cfg.wandb_log_freq == 0:
-            #     log_metrics_to_tensorboard_and_clearml(
-            #             smoothened_metrics,
-            #             "VLA Train",
-            #             log_step,
-            #             tb_writer=tb_writer,
-            #             clr_logger=logger,
-            #         )
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
@@ -1309,22 +1310,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_lr
-
-            # if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-            #     # Log the learning rate to wandb
-            #     wandb.log(
-            #         {
-            #             "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
-            #         },
-            #         step=log_step,
-            #     )
-            #     # Also log to TensorBoard
-            #     if tb_writer is not None:
-            #         tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
-            #         tb_writer.flush()
-            if tb_writer is not None and gradient_step_idx % cfg.wandb_log_freq == 0:
-                tb_writer.add_scalar("VLA Train/Learning Rate", scheduler.get_last_lr()[0], log_step)
-                tb_writer.flush()
     
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
@@ -1334,7 +1319,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 progress.update()
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+            if is_rank0() and gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
                 save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,
@@ -1349,7 +1334,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
 
             # Test model on validation set
-            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
+            if is_rank0() and cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
                 run_validation(
                     vla=vla,
                     action_head=action_head,
@@ -1371,27 +1356,31 @@ def finetune(cfg: FinetuneConfig) -> None:
             if log_step == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+            
     
     
     # Create a unique subdir under run_root_dir using timestamp
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    
-    if tb_writer is not None:
-        tb_writer.close()
-        print("[TensorBoard] Writer closed")
+    if is_rank0():
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Save only the PEFT/OFT adapters, not the full 7B backbone
-    vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
-    print(f"[SAVE] Saving VLA adapters to {vla_adapter_dir}", flush=True)
-    vla.module.save_pretrained(vla_adapter_dir)  # <-- key line
+        if tb_writer is not None:
+            tb_writer.close()
+            print("[TensorBoard] Writer closed")
 
-    # 2) Save action head weights (this is small, so torch.save is fine)
-    if cfg.use_l1_regression:
-        ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
-        print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
-        torch.save(action_head.module.state_dict(), ah_ckpt_path)
+        vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
+        print(f"[SAVE] Saving VLA adapters to {vla_adapter_dir}", flush=True)
+        vla.module.save_pretrained(vla_adapter_dir)
 
+        if cfg.use_l1_regression:
+            ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
+            print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
+            torch.save(action_head.module.state_dict(), ah_ckpt_path)
+    else:
+        # non-rank0 still should close writer if it exists, but don't write files
+        if tb_writer is not None:
+            tb_writer.close()
+            
 if __name__ == "__main__":
     finetune()
