@@ -104,7 +104,7 @@ class FinetuneConfig:
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
     max_steps: int = 200_000                         # Max number of training steps
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
-    val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
+    val_freq: int = 100_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
     val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
@@ -944,6 +944,12 @@ def finetune(cfg: FinetuneConfig) -> None:
     distributed_state = PartialState()
     device_id = distributed_state.local_process_index
     torch.cuda.set_device(device_id)
+    print(
+        f"[rank={distributed_state.process_index} local_rank={distributed_state.local_process_index}] "
+        f"cuda.current_device={torch.cuda.current_device()} "
+        f"device_name={torch.cuda.get_device_name(torch.cuda.current_device())}",
+        flush=True
+    )
     torch.cuda.empty_cache()
 
     # Create a simple dummy logger for compatibility
@@ -1036,7 +1042,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla = vla.to(device_id)
 
         vla.print_trainable_parameters()
-
+        
+        if cfg.resume:
+            adapter_path = os.path.join(cfg.vla_path, "vla_cdpr_adapter")
+            if os.path.exists(adapter_path):
+                print(f"Loading adapter weights from: {adapter_path}")
+                vla.load_adapter(adapter_path)
 
     # FiLM setup
     if cfg.use_film:
