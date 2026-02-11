@@ -12,8 +12,8 @@ import finetune as finetune_module
 from finetune import *
 
 # Paths to your existing checkpoints
-ADAPTER_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_20260117-122720/vla_cdpr_adapter"
-ACTION_HEAD_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_20260117-122720/action_head_cdpr.pt"
+ADAPTER_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step60000_20260208-011658_sbs700/vla_cdpr_adapter"
+ACTION_HEAD_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step60000_20260208-011658_sbs700/action_head_cdpr.pt"
 
 # Save the original load_checkpoint function
 original_load_checkpoint = load_checkpoint
@@ -367,7 +367,7 @@ def patched_finetune(cfg: FinetuneConfig) -> None:
             
             if is_rank0() and gradient_step_idx % cfg.save_freq == 0:
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_step{gradient_step_idx}_{timestamp}"
+                ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_step{gradient_step_idx}_{timestamp}_sbs{cfg.shuffle_buffer_size}"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
 
                 vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
@@ -383,7 +383,7 @@ def patched_finetune(cfg: FinetuneConfig) -> None:
     # Create a unique subdir under run_root_dir using timestamp
     if is_rank0():
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}"
+        ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}_sbs{cfg.shuffle_buffer_size}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         if tb_writer is not None:

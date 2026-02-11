@@ -86,7 +86,7 @@ class FinetuneConfig:
     data_root_dir: Path = Path("datasets/rlds")    # Directory containing RLDS datasets
     dataset_name: str = "cdpr_synth"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
-    shuffle_buffer_size: int = 128 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    shuffle_buffer_size: int = 700 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
@@ -896,6 +896,11 @@ def load_state_dict_skip_action_head(model, state_dict):
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     print(f"[LOAD] missing={len(missing)} unexpected={len(unexpected)} (action_head skipped)", flush=True)
 
+import torch.distributed as dist
+
+def dist_barrier():
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -1330,39 +1335,56 @@ def finetune(cfg: FinetuneConfig) -> None:
                 progress.update()
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if is_rank0() and gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
-                save_training_checkpoint(
-                    cfg=cfg,
-                    run_dir=run_dir,
-                    log_step=log_step,
-                    vla=vla,
-                    processor=processor,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-                    action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
-                    train_dataset=train_dataset,
-                    distributed_state=distributed_state,
-                )
+            # if is_rank0() and gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+            #     save_training_checkpoint(
+            #         cfg=cfg,
+            #         run_dir=run_dir,
+            #         log_step=log_step,
+            #         vla=vla,
+            #         processor=processor,
+            #         proprio_projector=proprio_projector if cfg.use_proprio else None,
+            #         noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+            #         action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+            #         train_dataset=train_dataset,
+            #         distributed_state=distributed_state,
+            #     )
 
             # Test model on validation set
-            if is_rank0() and cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
-                run_validation(
-                    vla=vla,
-                    action_head=action_head,
-                    noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-                    proprio_projector=proprio_projector if cfg.use_proprio else None,
-                    val_dataloader=val_dataloader,
-                    action_tokenizer=action_tokenizer,
-                    device_id=device_id,
-                    cfg=cfg,
-                    num_patches=NUM_PATCHES,
-                    log_step=log_step,
-                    distributed_state=distributed_state,
-                    val_time_limit=cfg.val_time_limit,
-                )
-                # Set model back to training mode after validation
-                vla.train()
+            # if is_rank0() and cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
+            #     run_validation(
+            #         vla=vla,
+            #         action_head=action_head,
+            #         noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
+            #         proprio_projector=proprio_projector if cfg.use_proprio else None,
+            #         val_dataloader=val_dataloader,
+            #         action_tokenizer=action_tokenizer,
+            #         device_id=device_id,
+            #         cfg=cfg,
+            #         num_patches=NUM_PATCHES,
+            #         log_step=log_step,
+            #         distributed_state=distributed_state,
+            #         val_time_limit=cfg.val_time_limit,
+            #     )
+            #     # Set model back to training mode after validation
+            #     vla.train()
+            dist_barrier()
+            torch.cuda.synchronize()
+                
+            if is_rank0() and (gradient_step_idx % cfg.save_freq == 0 or gradient_step_idx == 100):
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_step{gradient_step_idx}_{timestamp}_sbs{cfg.shuffle_buffer_size}"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+                vla_adapter_dir = ckpt_dir / "vla_cdpr_adapter"
+                print(f"[SAVE] Saving VLA adapters to {vla_adapter_dir}", flush=True)
+                vla.module.save_pretrained(vla_adapter_dir)
+
+                if cfg.use_l1_regression:
+                    ah_ckpt_path = ckpt_dir / "action_head_cdpr.pt"
+                    print(f"[SAVE] Saving action head weights to {ah_ckpt_path}", flush=True)
+                    torch.save(action_head.module.state_dict(), ah_ckpt_path)
+            dist_barrier()
+            
             # Stop training when max_steps is reached
             if log_step == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
@@ -1373,7 +1395,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create a unique subdir under run_root_dir using timestamp
     if is_rank0():
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}"
+        ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_{timestamp}_sbs{cfg.shuffle_buffer_size}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         if tb_writer is not None:

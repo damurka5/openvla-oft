@@ -18,14 +18,14 @@ def main() -> int:
     os.environ["WANDB_SILENT"] = "true"
     
     # Paths to your existing checkpoints
-    ADAPTER_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_20260117-122720/vla_cdpr_adapter"
-    ACTION_HEAD_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_20260117-122720/action_head_cdpr.pt"
-    
+    ADAPTER_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step60000_20260208-011658_sbs700/vla_cdpr_adapter"
+    ACTION_HEAD_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step60000_20260208-011658_sbs700/action_head_cdpr.pt"
+        
     print("=" * 60)
     print("CONTINUING TRAINING FROM EXISTING CHECKPOINT")
     print(f"Adapter path: {ADAPTER_PATH}")
     print(f"Action head path: {ACTION_HEAD_PATH}")
-    print(f"New learning rate: 1e-4")
+    print(f"New learning rate: 5e-4")
     print("=" * 60)
     
     # Build the command to run with torchrun
@@ -35,8 +35,8 @@ def main() -> int:
         "--nproc_per_node=2",
         str(Path(__file__).parent / "continue_finetune.py"),
         "--vla_path=moojink/openvla-7b-oft-finetuned-libero-spatial",
-        "--learning_rate=1e-4",
-        "--max_steps=20000",
+        "--learning_rate=5e-4",
+        "--max_steps=60000",
         "--data_root_dir=/root/repo/cdpr_synth_10hz",
         "--dataset_name=cdpr_local",
         "--run_root_dir=/root/repo/VLA_CDPR/oft_cdpr_ckpts",
@@ -45,7 +45,7 @@ def main() -> int:
         "--batch_size=4",
         "--num_images_in_input=2",
         "--use_proprio=True",
-        "--image_aug=False",
+        "--image_aug=True",
         "--lora_rank=32",
         "--lora_dropout=0.0",
         "--wandb_entity=dummy",

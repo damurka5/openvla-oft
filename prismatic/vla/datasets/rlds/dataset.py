@@ -540,110 +540,100 @@ def custom_decode_and_resize(obs, resize_size=None):
 
     return obs
 
-def apply_frame_transforms(dataset, resize_size=(224, 224), num_parallel_calls=None, train=True):
-    """Apply frame-level transforms to the dataset - fixed version"""
-    
+def apply_frame_transforms(
+    dataset,
+    *,
+    train: bool,
+    image_obs_keys=None,   # optional; caller might pass it
+    language_key: str = "language_instruction",  # optional; caller might pass it
+    image_augment_kwargs=None,
+    resize_size=(224, 224),
+    depth_resize_size=(),
+    num_parallel_calls=None,
+    **_unused,  # swallow any other unexpected keys safely
+):
+    """
+    Frame-level transforms with API parity:
+    - Squeeze singleton dims like (B,1) -> (B,)
+    - Decode+resize images if tf.string
+    - Optional augmentation when train=True
+    """
+    dataset = _ensure_dldataset(dataset)
+    import tensorflow as tf
+
+    if num_parallel_calls is None:
+        num_parallel_calls = tf.data.AUTOTUNE
+
+    # Normalize resize_size to dict per image key
     if isinstance(resize_size, tuple):
-        resize_size_dict = {
-            "image_primary": resize_size,
-            "image_wrist": resize_size,
-        }
+        resize_size_dict = {"image_primary": resize_size, "image_wrist": resize_size}
     else:
         resize_size_dict = resize_size
-    
-    print(f"[DEBUG FRAME TRANSFORMS] resize_size_dict: {resize_size_dict}", flush=True)
-    
-    def frame_transform_fn(frame):
-        """Transform function for each frame - only process if needed"""
-        print(f"[DEBUG FRAME TRANSFORM] Frame keys: {list(frame.keys())}", flush=True)
-        
+
+    # image_augment_kwargs may arrive as None
+    image_augment_kwargs = image_augment_kwargs or {}
+
+    # Decide which image fields exist / should be handled
+    if isinstance(image_obs_keys, dict):
+        image_names = [f"image_{k}" for k in image_obs_keys.keys()]
+    elif isinstance(image_obs_keys, (list, tuple)):
+        image_names = [n if n.startswith("image_") else f"image_{n}" for n in image_obs_keys]
+    else:
+        image_names = ["image_primary", "image_wrist"]
+
+    def _maybe_squeeze_rank2_strings(x):
+        # Your batches show shapes like (340,1). For tf.string, squeeze trailing singleton.
+        # Only squeeze if rank==2 and last dim==1; keep other tensors unchanged.
+        x = tf.convert_to_tensor(x)
+        return tf.cond(
+            tf.logical_and(tf.equal(tf.rank(x), 2), tf.equal(tf.shape(x)[-1], 1)),
+            lambda: tf.squeeze(x, axis=-1),
+            lambda: x,
+        )
+
+    def _squeeze_singletons(frame):
         obs = frame["observation"]
-        
-        # Check if images are already processed
-        image_keys = ["image_primary", "image_wrist"]
-        needs_processing = False
-        
-        for key in image_keys:
-            if key in obs and obs[key] is not None:
-                # If image has rank 2 ([batch, 1]), it needs decoding
-                if obs[key].dtype == tf.string:
-                    needs_processing = True
-                    break
-        
-        # Only apply transforms if images need processing
-        if needs_processing:
-            print(f"[DEBUG FRAME TRANSFORM] Images need processing, applying transforms", flush=True)
-            frame["observation"] = custom_decode_and_resize(obs, resize_size_dict)
-        else:
-            print(f"[DEBUG FRAME TRANSFORM] Images already processed, skipping", flush=True)
-        
+        for name in image_names:
+            if name in obs and obs[name] is not None and obs[name].dtype == tf.string:
+                obs[name] = _maybe_squeeze_rank2_strings(obs[name])
+
+        # Some datasets also store language as (B,1) tf.string; harmless to squeeze too
+        if "task" in frame and isinstance(frame["task"], dict) and language_key in frame["task"]:
+            t = frame["task"][language_key]
+            if hasattr(t, "dtype") and t.dtype == tf.string:
+                frame["task"][language_key] = _maybe_squeeze_rank2_strings(t)
+
+        frame["observation"] = obs
         return frame
-    
-    dataset = dataset.frame_map(frame_transform_fn, num_parallel_calls=num_parallel_calls)
+
+    def _decode_resize_and_maybe_aug(frame):
+        obs = frame["observation"]
+
+        # Decode+resize only if any image is tf.string
+        needs_decode = any(
+            (k in obs and obs[k] is not None and obs[k].dtype == tf.string)
+            for k in image_names
+        )
+
+        if needs_decode:
+            obs = custom_decode_and_resize(obs, resize_size_dict)
+
+        # Optional augmentation: only when training and kwargs provided
+        # NOTE: replace `obs_transforms.augment` with your actual augment fn if different.
+        if train and image_augment_kwargs:
+            # Use deterministic per-example seeds (or per-frame) to avoid identical aug across batch
+            seed = tf.random.uniform([2], maxval=tf.int32.max, dtype=tf.int32)
+            # If you have a custom augment function, call it here.
+            # Example if you use prismatic/vla/datasets/obs_transforms.py:
+            # obs = obs_transforms.augment(obs, seed=seed, augment_kwargs=image_augment_kwargs)
+            obs = obs_transforms.augment(obs, seed=seed, augment_kwargs=image_augment_kwargs)
+
+        frame["observation"] = obs
+        return frame
+
+    dataset = dataset.frame_map(_squeeze_singletons, num_parallel_calls=num_parallel_calls)
+    dataset = dataset.frame_map(_decode_resize_and_maybe_aug, num_parallel_calls=num_parallel_calls)
     return dataset
-
-# def apply_frame_transforms(
-#     dataset: dl.DLataset,
-#     *,
-#     train: bool,                                # kept for API parity; not passed to transforms below
-#     image_obs_keys=None,                        # {"primary": "...", "wrist": "..."} or ["primary","wrist"]
-#     language_key: str = "language_instruction",
-#     image_augment_kwargs: Union[Dict, Dict[str, Dict]] = {},
-#     resize_size: Union[Tuple[int, int], Dict[str, Tuple[int, int]]] = {},
-#     depth_resize_size: Union[Tuple[int, int], Dict[str, Tuple[int, int]]] = {},
-#     num_parallel_calls: int = tf.data.AUTOTUNE,
-# ) -> dl.DLataset:
-#     dataset = _ensure_dldataset(dataset)
-#     import tensorflow as tf
-#     from functools import partial
-
-#     # Standardize image field names
-#     if isinstance(image_obs_keys, dict):
-#         image_names = [f"image_{k}" for k in image_obs_keys.keys()]
-#     elif isinstance(image_obs_keys, (list, tuple)):
-#         image_names = [n if n.startswith("image_") else f"image_{n}" for n in image_obs_keys]
-#     else:
-#         image_names = ["image_primary", "image_wrist"]
-
-#     # 1) Squeeze any rank-1, length-1 strings to scalars BEFORE decoding
-#     def _squeeze_singletons(frame):
-#         obs = frame["observation"]
-
-#         def _maybe_squeeze(x):
-#             return tf.cond(tf.equal(tf.rank(x), 1), lambda: x[0], lambda: x)
-
-#         for name in image_names:
-#             if name in obs:
-#                 obs[name] = _maybe_squeeze(obs[name])
-
-#         if "task" in frame and language_key in frame["task"]:
-#             frame["task"][language_key] = _maybe_squeeze(frame["task"][language_key])
-#         return frame
-
-#     dataset = dataset.frame_map(_squeeze_singletons, num_parallel_calls)
-
-#     # 2) Helpers: apply transform to observation ONLY (no vmap!)
-#     def apply_obs_only(fn, frame: Dict) -> Dict:
-#         frame["observation"] = fn(frame["observation"])
-#         return frame
-
-#     # 3) Decode + resize images (no 'train' kwarg)
-#     decode_resize = partial(
-#         obs_transforms.decode_and_resize,
-#         resize_size=resize_size,
-#         depth_resize_size=depth_resize_size,
-#     )
-#     dataset = dataset.frame_map(partial(apply_obs_only, decode_resize), num_parallel_calls)
-
-#     # 4) Optional augmentation (no 'train' kwarg)
-#     if train and image_augment_kwargs:
-#         def aug(frame: dict):
-#             seed = tf.random.uniform([2], maxval=tf.dtypes.int32.max, dtype=tf.int32)
-#             aug_fn = partial(obs_transforms.augment, seed=seed, augment_kwargs=image_augment_kwargs)
-#             return apply_obs_only(aug_fn, frame)
-#         dataset = dataset.frame_map(aug, num_parallel_calls)
-
-#     return dataset
 
 
 def make_single_dataset(
@@ -966,11 +956,11 @@ def make_interleaved_dataset(
     success = test_single_batch(dataset)
     print(f"[DEBUG] Before frame transforms test: {success}", flush=True)
 
-    if success:
-        dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
-        print("[DEBUG] Testing dataset after frame transforms...", flush=True)
-        success = test_single_batch(dataset)
-        print(f"[DEBUG] After frame transforms test: {success}", flush=True)
+    # if success:
+    #     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
+    #     print("[DEBUG] Testing dataset after frame transforms...", flush=True)
+    #     success = test_single_batch(dataset)
+    #     print(f"[DEBUG] After frame transforms test: {success}", flush=True)
         
     #######
 
