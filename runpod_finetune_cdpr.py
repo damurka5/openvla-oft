@@ -32,7 +32,7 @@ def main() -> int:
     batch_size = os.environ.get("BATCH_SIZE", "4")
     lr = os.environ.get("LEARNING_RATE", "5e-4")
     num_images = os.environ.get("NUM_IMAGES_IN_INPUT", "2")
-    use_proprio = os.environ.get("USE_PROPRIO", "True")
+    use_proprio = os.environ.get("USE_PROPRIO", "False")
     image_aug = os.environ.get("IMAGE_AUG", "False")
     
     # ---------- Environment ----------

@@ -381,9 +381,20 @@ def run_forward_pass(
         return loss, metrics
 
     # ---- Continuous action paths (L1 regression / diffusion) ----
-    last_hidden_states = output.hidden_states[-1]  # (B, num_patches + L, D) in OpenVLA-style
-    # Align with labels[:,1:] just like the discrete path does with logits[:, num_patches:-1]
-    text_hidden_states = last_hidden_states[:, num_patches:-1]  # (B, L-1, D)
+    # last_hidden_states = output.hidden_states[-1]  # (B, num_patches + L, D) in OpenVLA-style
+    # # Align with labels[:,1:] just like the discrete path does with logits[:, num_patches:-1]
+    # text_hidden_states = last_hidden_states[:, num_patches:-1]  # (B, L-1, D)
+
+    last_hs = output.hidden_states[-1]  # (B, 1 + P + (L-1), D)
+    P = num_patches                     # IMPORTANT: must match what forward inserted
+    # Rebuild hidden states aligned to *text token indices* (same indexing as input_ids/labels)
+    text_hidden_states = torch.cat([last_hs[:, :1, :], last_hs[:, 1 + P :, :]], dim=1)  # (B, L, D)
+
+    # Hard assert to catch any drift immediately
+    assert text_hidden_states.shape[1] == batch["input_ids"].shape[1], (
+        f"text_hidden_states len {text_hidden_states.shape[1]} != input_ids len {batch['input_ids'].shape[1]}"
+    )
+
 
     batch_size = input_ids.shape[0]
     D = text_hidden_states.shape[-1]

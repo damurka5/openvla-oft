@@ -79,7 +79,19 @@ class MLPResNet(nn.Module):
         x = self.layer_norm2(x)  # shape: (batch_size, hidden_dim)
         x = self.fc2(x)  # shape: (batch_size, output_dim)
         return x
+    
+import hashlib
 
+def sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+def sha1_tensor(t: torch.Tensor) -> str:
+    x = t.detach()
+    if x.is_cuda:
+        x = x.cpu()
+
+    x = x.float().contiguous()
+    return hashlib.sha1(x.numpy().tobytes()).hexdigest()
 
 class L1RegressionActionHead(nn.Module):
     """Simple MLP-based action head that generates continuous actions via L1 regression."""
@@ -138,13 +150,10 @@ class L1RegressionActionHead(nn.Module):
         # (B, 40, 4096) -> (B, 8, 5, 4096) -> (B, 8, 20480)
         x = actions_hidden_states.view(B, NUM_ACTIONS_CHUNK, ACTION_DIM, self.input_dim)
         x = x.reshape(B, NUM_ACTIONS_CHUNK, ACTION_DIM * self.input_dim)
-
-        # MLPResNet expects 2D, so flatten chunk dimension into batch:
         x = x.reshape(B * NUM_ACTIONS_CHUNK, -1)  # (B*8, 20480)
 
         y = self.model(x)  # (B*8, ACTION_DIM)
 
-        # reshape back:
         y = y.view(B, NUM_ACTIONS_CHUNK, self.action_dim)  # (B, 8, 5)
         return y
 

@@ -716,6 +716,23 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def _reorder_cache(self, *args, **kwargs) -> Any:
         return self.language_model._reorder_cache(*args, **kwargs)
 
+import hashlib
+import numpy as np
+import torch
+
+def _sha1_tensor(t: torch.Tensor) -> str:
+    x = t.detach().float().cpu().contiguous().numpy()
+    return hashlib.sha1(x.tobytes()).hexdigest()
+
+def _summ(t: torch.Tensor, name: str):
+    t2 = t.detach()
+    print(
+        f"[DBG] {name}: shape={tuple(t2.shape)} dtype={t2.dtype} device={t2.device} "
+        f"min={float(t2.min().cpu()) if t2.numel() else 'NA'} "
+        f"max={float(t2.max().cpu()) if t2.numel() else 'NA'} "
+        f"mean={float(t2.float().mean().cpu()) if t2.numel() else 'NA'} "
+        f"std={float(t2.float().std(unbiased=False).cpu()) if t2.numel() else 'NA'}"
+    )
 
 class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     config_class: PretrainedConfig = OpenVLAConfig
@@ -903,6 +920,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
+        print("[DBG] ENTER _regression_or_discrete_prediction", flush=True)
         all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
         input_embeddings = input_embeddings * ~all_actions_mask
 
@@ -910,6 +928,23 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
             input_embeddings, projected_patch_embeddings, attention_mask
         )
+
+        print("\n[DBG] After building multimodal attention:")
+        _summ(multimodal_embeddings, "multimodal_embeddings")
+        _summ(multimodal_attention_mask, "multimodal_attention_mask")
+        # check that the multimodal mask is "on" for the region you will slice
+        mm = multimodal_attention_mask[0].detach()
+        print("[DBG] multimodal_attention_mask sum:", float(mm.float().sum().cpu()))
+        # show mask sum around the slice start you use:
+        slice_start = int(NUM_PATCHES + NUM_PROMPT_TOKENS)
+        slice_end = int(slice_start + ACTION_DIM * NUM_ACTIONS_CHUNK)
+        print(f"[DBG] your slice indices (multimodal): [{slice_start}, {slice_end})")
+        if slice_end <= mm.numel():
+            print("[DBG] multimodal mask sum over your slice:",
+                float(mm[slice_start:slice_end].float().sum().cpu()),
+                "/", int(ACTION_DIM*NUM_ACTIONS_CHUNK))
+        else:
+            print("[DBG] WARNING: slice_end beyond mask length!")
 
         # Forward pass through language model
         language_model_output = self.language_model(
@@ -932,6 +967,34 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
             :,
         ]  # (B, act_chunk_len, D)
+
+        import hashlib
+
+        def _sha1_tensor(t: torch.Tensor) -> str:
+            x = t.detach().float().cpu().contiguous().numpy()
+            return hashlib.sha1(x.tobytes()).hexdigest()
+
+        # ---- DEBUG right after actions_hidden_states is created ----
+        print("\n[DBG] ====== _regression_or_discrete_prediction ======", flush=True)
+        print("[DBG] last_hidden_states:", tuple(last_hidden_states.shape), last_hidden_states.dtype, last_hidden_states.device, flush=True)
+
+        start = int(NUM_PATCHES + NUM_PROMPT_TOKENS)
+        end = int(start + ACTION_DIM * NUM_ACTIONS_CHUNK)
+        print(f"[DBG] slice start/end = {start}:{end} (need {ACTION_DIM*NUM_ACTIONS_CHUNK} tokens)", flush=True)
+
+        mmask = multimodal_attention_mask[0] if multimodal_attention_mask is not None else None
+        if mmask is not None:
+            s = float(mmask[start:end].float().sum().cpu()) if end <= mmask.numel() else -1.0
+            print(f"[DBG] multimodal_attention_mask sum over slice = {s}/{ACTION_DIM*NUM_ACTIONS_CHUNK}", flush=True)
+
+        print("[DBG] actions_hidden_states:", tuple(actions_hidden_states.shape), actions_hidden_states.dtype, actions_hidden_states.device, flush=True)
+        print("[DBG] actions_hidden_states sha1:", _sha1_tensor(actions_hidden_states), flush=True)
+        print("[DBG] actions_hidden_states mean/std:",
+            float(actions_hidden_states.float().mean().cpu()),
+            float(actions_hidden_states.float().std(unbiased=False).cpu()),
+            flush=True)
+        print("[DBG] ===============================================\n", flush=True)
+
 
         # Handle different prediction methods
         if action_head is not None:
@@ -983,6 +1046,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         Returns:
             Tuple of (unnormalized_actions, action_hidden_states)
         """
+        print("[DBG] ENTER OpenVLAForActionPrediction.predict_action", flush=True)
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
         if not torch.all(input_ids[:, -1] == 29871):
@@ -993,18 +1057,51 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         pixel_values = kwargs["pixel_values"]
         attention_mask = kwargs["attention_mask"]
 
+        print("\n================= ACTION-HEAD DEBUG =================")
+        _summ(input_ids, "input_ids(before)")
+        _summ(attention_mask, "attention_mask(before)")
+        print("[DBG] last 12 input_ids(before):", input_ids[0, -12:].detach().cpu().tolist())
+
         # Create fake labels tensor (needed for action mask)
         labels = input_ids.clone()
         labels[:] = IGNORE_INDEX
 
-        # Get number of tokens in prompt (excluding the start token)
-        NUM_PROMPT_TOKENS = input_ids.shape[-1] - 1  # Subtract action tokens and stop token
-
         # Prepare inputs by adding necessary tokens
         input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
 
+        print("[DBG] NUM_PROMPT_TOKENS (as currently computed) =", int(NUM_PROMPT_TOKENS))
+        # Get number of tokens in prompt (excluding the start token)
+        NUM_PROMPT_TOKENS = input_ids.shape[-1] - 1  # Subtract action tokens and stop token
+
         # Update labels tensor for action mask computation later
         labels = self._prepare_labels_for_action_prediction(labels, input_ids)
+
+        print("\n[DBG] After preparing inputs/labels:")
+        _summ(input_ids, "input_ids(after)")
+        _summ(attention_mask, "attention_mask(after)")
+        _summ(labels, "labels(after)")
+        print("[DBG] last 60 input_ids(after):", input_ids[0, -60:].detach().cpu().tolist())
+        print("[DBG] last 60 labels(after):   ", labels[0, -60:].detach().cpu().tolist())
+
+        # compute masks + show where action tokens are
+        all_actions_mask_dbg = self._process_action_masks(labels)  # (B, seq_len)
+        _summ(all_actions_mask_dbg.to(torch.int32), "all_actions_mask(int)")
+        idx = torch.where(all_actions_mask_dbg[0])[0]
+        print("[DBG] all_actions_mask true count:", int(idx.numel()))
+        if idx.numel() > 0:
+            print("[DBG] first/last action-mask idx:", int(idx[0]), int(idx[-1]))
+            print("[DBG] action-mask idx head:", idx[:20].detach().cpu().tolist())
+            print("[DBG] action-mask idx tail:", idx[-20:].detach().cpu().tolist())
+
+        # expected placeholder/action region indices *in the TEXT sequence* (before adding patches)
+        # placeholders are appended in _prepare_input_for_action_prediction as:
+        #   [original prompt tokens] + [ACTION_DIM*NUM_ACTIONS_CHUNK placeholders] + [STOP]
+        orig_prompt_len = int(input_ids.shape[-1]) - (ACTION_DIM * NUM_ACTIONS_CHUNK) - 1
+        exp_action_start_text = orig_prompt_len
+        exp_action_end_text = exp_action_start_text + ACTION_DIM * NUM_ACTIONS_CHUNK - 1
+        print(f"[DBG] expected TEXT action placeholders span: [{exp_action_start_text}, {exp_action_end_text}] "
+            f"(len={ACTION_DIM*NUM_ACTIONS_CHUNK})")
+        print("[DBG] STOP token position (text):", int(input_ids.shape[-1] - 1))
 
         # Get input embeddings and action masks
         input_embeddings = self.get_input_embeddings()(input_ids)

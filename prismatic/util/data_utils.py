@@ -11,6 +11,14 @@ import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
+from prismatic.vla.constants import (
+    ACTION_DIM,
+    ACTION_PROPRIO_NORMALIZATION_TYPE,
+    NUM_ACTIONS_CHUNK,
+    PROPRIO_DIM,
+    IGNORE_INDEX
+)
+
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
 
@@ -114,7 +122,26 @@ class PaddedCollatorForActionPrediction:
         labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
 
         # Truncate (if necessary)
-        input_ids, labels = input_ids[:, : self.model_max_length], labels[:, : self.model_max_length]
+        # input_ids, labels = input_ids[:, : self.model_max_length], labels[:, : self.model_max_length]
+
+        # How many tokens at the end must be preserved (actions + stop token)
+        A = ACTION_DIM * NUM_ACTIONS_CHUNK
+        TAIL = A + 1  # +1 for STOP/EOS token
+
+        L = input_ids.shape[1]
+        if L > self.model_max_length:
+            # Keep the last TAIL tokens intact, truncate from the left of the prompt region
+            keep_tail = input_ids[:, L - TAIL : L]
+            keep_tail_labels = labels[:, L - TAIL : L]
+
+            # Remaining budget for the prefix
+            budget = self.model_max_length - TAIL
+            keep_head = input_ids[:, :budget]
+            keep_head_labels = labels[:, :budget]
+
+            input_ids = torch.cat([keep_head, keep_tail], dim=1)
+            labels = torch.cat([keep_head_labels, keep_tail_labels], dim=1)
+
 
         # Get `attention_mask` by checking for `pad_token_id`
         attention_mask = input_ids.ne(self.pad_token_id)
