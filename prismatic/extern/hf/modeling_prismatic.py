@@ -480,6 +480,11 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             multimodal_attention_mask = torch.cat(
                 [attention_mask[:, :1], projected_patch_attention_mask, attention_mask[:, 1:]], dim=1
             )
+            
+        print("[DEBUG MM] input_embeddings:", tuple(input_embeddings.shape), flush=True)
+        print("[DEBUG MM] patch_embeddings:", tuple(projected_patch_embeddings.shape), flush=True)
+        print("[DEBUG MM] multimodal_embeddings:", tuple(multimodal_embeddings.shape), flush=True)
+        print("[DEBUG MM] multimodal_attention_mask:", tuple(multimodal_attention_mask.shape), flush=True)
 
         return multimodal_embeddings, multimodal_attention_mask
 
@@ -716,23 +721,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def _reorder_cache(self, *args, **kwargs) -> Any:
         return self.language_model._reorder_cache(*args, **kwargs)
 
-import hashlib
-import numpy as np
-import torch
-
-def _sha1_tensor(t: torch.Tensor) -> str:
-    x = t.detach().float().cpu().contiguous().numpy()
-    return hashlib.sha1(x.tobytes()).hexdigest()
-
-def _summ(t: torch.Tensor, name: str):
-    t2 = t.detach()
-    print(
-        f"[DBG] {name}: shape={tuple(t2.shape)} dtype={t2.dtype} device={t2.device} "
-        f"min={float(t2.min().cpu()) if t2.numel() else 'NA'} "
-        f"max={float(t2.max().cpu()) if t2.numel() else 'NA'} "
-        f"mean={float(t2.float().mean().cpu()) if t2.numel() else 'NA'} "
-        f"std={float(t2.float().std(unbiased=False).cpu()) if t2.numel() else 'NA'}"
-    )
 
 class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
     config_class: PretrainedConfig = OpenVLAConfig
@@ -750,9 +738,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
     def _prepare_input_for_action_prediction(self, input_ids, attention_mask):
         """Prepares input for action prediction by adding necessary tokens"""
-        # Add (ACTION_DIM * NUM_ACTIONS_CHUNK) placeholder tokens to input_ids to simulate action tokens
-        placeholder_action_token_ids = (
-            torch.ones((input_ids.shape[0], ACTION_DIM * NUM_ACTIONS_CHUNK)).to(input_ids.device).to(input_ids.dtype)
+        # Use the same placeholder token id that labels will mark as an action token.
+        # Using a generic token id like `1` (often <unk>/<s>) can make the action-token region behave unexpectedly.
+        ARBITRARY_ACTION_TOKEN_IDX = ACTION_TOKEN_BEGIN_IDX + 1
+        placeholder_action_token_ids = torch.full(
+            (input_ids.shape[0], ACTION_DIM * NUM_ACTIONS_CHUNK),
+            fill_value=ARBITRARY_ACTION_TOKEN_IDX,
+            device=input_ids.device,
+            dtype=input_ids.dtype,
         )
         input_ids = torch.cat([input_ids, placeholder_action_token_ids], dim=-1)
 
@@ -915,12 +908,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         attention_mask,
         labels,
         NUM_PATCHES,
-        NUM_PROMPT_TOKENS,
+        prompt_len,
         action_head=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
-        print("[DBG] ENTER _regression_or_discrete_prediction", flush=True)
         all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
         input_embeddings = input_embeddings * ~all_actions_mask
 
@@ -928,23 +920,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
             input_embeddings, projected_patch_embeddings, attention_mask
         )
-
-        print("\n[DBG] After building multimodal attention:")
-        _summ(multimodal_embeddings, "multimodal_embeddings")
-        _summ(multimodal_attention_mask, "multimodal_attention_mask")
-        # check that the multimodal mask is "on" for the region you will slice
-        mm = multimodal_attention_mask[0].detach()
-        print("[DBG] multimodal_attention_mask sum:", float(mm.float().sum().cpu()))
-        # show mask sum around the slice start you use:
-        slice_start = int(NUM_PATCHES + NUM_PROMPT_TOKENS)
-        slice_end = int(slice_start + ACTION_DIM * NUM_ACTIONS_CHUNK)
-        print(f"[DBG] your slice indices (multimodal): [{slice_start}, {slice_end})")
-        if slice_end <= mm.numel():
-            print("[DBG] multimodal mask sum over your slice:",
-                float(mm[slice_start:slice_end].float().sum().cpu()),
-                "/", int(ACTION_DIM*NUM_ACTIONS_CHUNK))
-        else:
-            print("[DBG] WARNING: slice_end beyond mask length!")
 
         # Forward pass through language model
         language_model_output = self.language_model(
@@ -960,65 +935,57 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             return_dict=True,
         )
 
-        # Extract hidden states for action tokens
-        last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-        actions_hidden_states = last_hidden_states[
-            :,
-            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-            :,
-        ]  # (B, act_chunk_len, D)
+        # Multimodal hidden states: (B, 1 + P + (L-1), D)
+        last_hidden_states = language_model_output.hidden_states[-1]
 
-        import hashlib
+        # Convert to TEXT-aligned hidden states: (B, L, D)
+        P_actual = projected_patch_embeddings.shape[1]   # <-- ground truth
+        if P_actual != NUM_PATCHES:
+            print(f"[WARN] NUM_PATCHES={NUM_PATCHES} but projected_patch_embeddings has P={P_actual}", flush=True)
 
-        def _sha1_tensor(t: torch.Tensor) -> str:
-            x = t.detach().float().cpu().contiguous().numpy()
-            return hashlib.sha1(x.tobytes()).hexdigest()
-
-        # ---- DEBUG right after actions_hidden_states is created ----
-        print("\n[DBG] ====== _regression_or_discrete_prediction ======", flush=True)
-        print("[DBG] last_hidden_states:", tuple(last_hidden_states.shape), last_hidden_states.dtype, last_hidden_states.device, flush=True)
-
-        start = int(NUM_PATCHES + NUM_PROMPT_TOKENS)
-        end = int(start + ACTION_DIM * NUM_ACTIONS_CHUNK)
-        print(f"[DBG] slice start/end = {start}:{end} (need {ACTION_DIM*NUM_ACTIONS_CHUNK} tokens)", flush=True)
-
-        mmask = multimodal_attention_mask[0] if multimodal_attention_mask is not None else None
-        if mmask is not None:
-            s = float(mmask[start:end].float().sum().cpu()) if end <= mmask.numel() else -1.0
-            print(f"[DBG] multimodal_attention_mask sum over slice = {s}/{ACTION_DIM*NUM_ACTIONS_CHUNK}", flush=True)
-
-        print("[DBG] actions_hidden_states:", tuple(actions_hidden_states.shape), actions_hidden_states.dtype, actions_hidden_states.device, flush=True)
-        print("[DBG] actions_hidden_states sha1:", _sha1_tensor(actions_hidden_states), flush=True)
-        print("[DBG] actions_hidden_states mean/std:",
-            float(actions_hidden_states.float().mean().cpu()),
-            float(actions_hidden_states.float().std(unbiased=False).cpu()),
-            flush=True)
-        print("[DBG] ===============================================\n", flush=True)
+        text_hidden_states = torch.cat(
+            [last_hidden_states[:, :1, :], last_hidden_states[:, 1 + P_actual :, :]], dim=1
+        )
 
 
-        # Handle different prediction methods
+        # Sanity: must match prepared input_ids length
+        assert text_hidden_states.shape[1] == input_embeddings.shape[1], (
+            f"text_hidden_states len {text_hidden_states.shape[1]} != input_ids len {input_embeddings.shape[1]}"
+        )
+
+        A = ACTION_DIM * NUM_ACTIONS_CHUNK
+
+        # Slice action-token region in TEXT space
+        actions_hidden_states = text_hidden_states[:, prompt_len : prompt_len + A, :]  # (B, A, D)
+
+        if torch.distributed.get_rank() == 0 and (torch.rand(()) < 0.01):
+            ah = actions_hidden_states
+            print("[DEBUG ACTION_HS] shape:", tuple(ah.shape), flush=True)
+            print("[DEBUG ACTION_HS] mean/std:", float(ah.mean()), float(ah.std()), flush=True)
+
+            # if batch > 1: compare sample 0 vs 1
+            if ah.shape[0] > 1:
+                diff = (ah[0] - ah[1]).abs().mean()
+                print("[DEBUG ACTION_HS] |hs0-hs1| mean:", float(diff), flush=True)
+
         if action_head is not None:
             # L1 regression prediction
-            normalized_actions = action_head.predict_action(actions_hidden_states)
+            normalized_actions = action_head.predict_action(actions_hidden_states)  # expects (B, A, D)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
-            # Discrete token-based prediction
-            predicted_action_token_ids = (
-                language_model_output.logits[
-                    :,
-                    NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-                ]
-                .argmax(dim=2)
-                .cpu()
-                .numpy()
-            )
+            # Discrete token prediction: convert logits to TEXT-aligned logits too
+            logits = language_model_output.logits  # (B, 1+P+(L-1), vocab)
+            text_logits = torch.cat([logits[:, :1, :], logits[:, 1 + P :, :]], dim=1)  # (B, L, vocab)
+
+            predicted_action_token_ids = text_logits[:, prompt_len : prompt_len + A, :].argmax(dim=2).cpu().numpy()
             discretized_actions = self.vocab_size - predicted_action_token_ids
             discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
             normalized_actions = self.bin_centers[discretized_actions]
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
         return normalized_actions, actions_hidden_states
+
 
     def predict_action(
         self,
@@ -1046,7 +1013,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         Returns:
             Tuple of (unnormalized_actions, action_hidden_states)
         """
-        print("[DBG] ENTER OpenVLAForActionPrediction.predict_action", flush=True)
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
         if not torch.all(input_ids[:, -1] == 29871):
@@ -1057,51 +1023,32 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         pixel_values = kwargs["pixel_values"]
         attention_mask = kwargs["attention_mask"]
 
-        print("\n================= ACTION-HEAD DEBUG =================")
-        _summ(input_ids, "input_ids(before)")
-        _summ(attention_mask, "attention_mask(before)")
-        print("[DBG] last 12 input_ids(before):", input_ids[0, -12:].detach().cpu().tolist())
-
         # Create fake labels tensor (needed for action mask)
         labels = input_ids.clone()
         labels[:] = IGNORE_INDEX
 
-        # Prepare inputs by adding necessary tokens
+        # Prepare inputs by appending action placeholder tokens and a STOP token.
+        # # Sequence becomes: [prompt] + [ACTION_DIM*NUM_ACTIONS_CHUNK placeholders] + [STOP]
+        # input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
+
+        # # Number of prompt tokens in the *prepared* sequence (excluding placeholders and STOP).
+        # NUM_PROMPT_TOKENS = input_ids.shape[-1] - (ACTION_DIM * NUM_ACTIONS_CHUNK) - 1
+        
+        # Save original prompt length (text token indices) BEFORE we append action placeholders/STOP
+        prompt_len = input_ids.shape[1]
+
+        # Append placeholders + STOP
         input_ids, attention_mask = self._prepare_input_for_action_prediction(input_ids, attention_mask)
 
-        print("[DBG] NUM_PROMPT_TOKENS (as currently computed) =", int(NUM_PROMPT_TOKENS))
-        # Get number of tokens in prompt (excluding the start token)
-        NUM_PROMPT_TOKENS = input_ids.shape[-1] - 1  # Subtract action tokens and stop token
+        # Optional sanity: prepared sequence should be prompt + A + 1
+        A = ACTION_DIM * NUM_ACTIONS_CHUNK
+        assert input_ids.shape[1] == prompt_len + A + 1, (
+            f"Prepared input length mismatch: got {input_ids.shape[1]}, expected {prompt_len + A + 1}"
+        )
+
 
         # Update labels tensor for action mask computation later
         labels = self._prepare_labels_for_action_prediction(labels, input_ids)
-
-        print("\n[DBG] After preparing inputs/labels:")
-        _summ(input_ids, "input_ids(after)")
-        _summ(attention_mask, "attention_mask(after)")
-        _summ(labels, "labels(after)")
-        print("[DBG] last 60 input_ids(after):", input_ids[0, -60:].detach().cpu().tolist())
-        print("[DBG] last 60 labels(after):   ", labels[0, -60:].detach().cpu().tolist())
-
-        # compute masks + show where action tokens are
-        all_actions_mask_dbg = self._process_action_masks(labels)  # (B, seq_len)
-        _summ(all_actions_mask_dbg.to(torch.int32), "all_actions_mask(int)")
-        idx = torch.where(all_actions_mask_dbg[0])[0]
-        print("[DBG] all_actions_mask true count:", int(idx.numel()))
-        if idx.numel() > 0:
-            print("[DBG] first/last action-mask idx:", int(idx[0]), int(idx[-1]))
-            print("[DBG] action-mask idx head:", idx[:20].detach().cpu().tolist())
-            print("[DBG] action-mask idx tail:", idx[-20:].detach().cpu().tolist())
-
-        # expected placeholder/action region indices *in the TEXT sequence* (before adding patches)
-        # placeholders are appended in _prepare_input_for_action_prediction as:
-        #   [original prompt tokens] + [ACTION_DIM*NUM_ACTIONS_CHUNK placeholders] + [STOP]
-        orig_prompt_len = int(input_ids.shape[-1]) - (ACTION_DIM * NUM_ACTIONS_CHUNK) - 1
-        exp_action_start_text = orig_prompt_len
-        exp_action_end_text = exp_action_start_text + ACTION_DIM * NUM_ACTIONS_CHUNK - 1
-        print(f"[DBG] expected TEXT action placeholders span: [{exp_action_start_text}, {exp_action_end_text}] "
-            f"(len={ACTION_DIM*NUM_ACTIONS_CHUNK})")
-        print("[DBG] STOP token position (text):", int(input_ids.shape[-1] - 1))
 
         # Get input embeddings and action masks
         input_embeddings = self.get_input_embeddings()(input_ids)
@@ -1114,6 +1061,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Process vision features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        
+        if torch.distributed.get_rank() == 0 and (torch.rand(()) < 0.01):  # ~1% of calls
+            p = projected_patch_embeddings
+            print("[DEBUG PATCH] projected_patch_embeddings:", tuple(p.shape), flush=True)
+            print("[DEBUG PATCH] mean/std:", float(p.mean()), float(p.std()), flush=True)
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
@@ -1149,7 +1101,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 labels,
                 attention_mask,
                 NUM_PATCHES,
-                NUM_PROMPT_TOKENS,
+                prompt_len, # NUM_PROMPT_TOKENS,
                 noisy_action_projector,
             )
         else:
@@ -1161,7 +1113,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 attention_mask,
                 labels,
                 NUM_PATCHES,
-                NUM_PROMPT_TOKENS,
+                prompt_len,
                 action_head,
             )
 

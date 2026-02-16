@@ -28,12 +28,12 @@ def main() -> int:
     tb_port = int(os.environ.get("TENSORBOARD_PORT", "6006"))
     
     # Training knobs
-    max_steps = os.environ.get("MAX_STEPS", "60_000")
+    max_steps = os.environ.get("MAX_STEPS", "10_000")
     batch_size = os.environ.get("BATCH_SIZE", "4")
     lr = os.environ.get("LEARNING_RATE", "5e-4")
     num_images = os.environ.get("NUM_IMAGES_IN_INPUT", "2")
     use_proprio = os.environ.get("USE_PROPRIO", "False")
-    image_aug = os.environ.get("IMAGE_AUG", "False")
+    image_aug = os.environ.get("IMAGE_AUG", "True")
     
     # ---------- Environment ----------
     os.environ["VLA_ROBOT"] = "CDPR"
@@ -52,7 +52,7 @@ def main() -> int:
     print(f"[INFO] run_root_dir={run_root_dir}", flush=True)
     
     # Verify the data exists
-    tfrecord_dir = Path(data_root) / "libero_spatial_no_noops" / "tfrecords_human_control"
+    tfrecord_dir = Path(data_root) / "libero_spatial_no_noops" / "tfrecords_human_control_fixed"
     stats_file = Path(data_root) / "action_stats_libero_spatial_no_noops.json"
     dataset_stats_file = Path(data_root) / "dataset_statistics.json"
     

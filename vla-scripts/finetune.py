@@ -59,7 +59,8 @@ from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
-    IGNORE_INDEX
+    IGNORE_INDEX,
+    STOP_INDEX
 )
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
@@ -413,6 +414,19 @@ def run_forward_pass(
     # Gather per-batch to preserve order and avoid flattening surprises
     action_hs_list = []
     for b in range(batch_size):
+        L_h = text_hidden_states.shape[1]
+        L_m = sup_mask.shape[1]
+        if L_h != L_m:
+            print(f"[ALIGN] text_hidden_states L={L_h}, sup_mask L={L_m}", flush=True)
+
+            # If sup_mask is built from labels[:, 1:], it's prediction-aligned (L-1)
+            # so hidden states must be truncated to L-1 as well:
+            if L_h == L_m + 1:
+                text_hidden_states = text_hidden_states[:, :-1, :]   # drop final position
+            else:
+                # hard fail: unknown mismatch
+                raise RuntimeError(f"Unexpected length mismatch: hidden={L_h}, mask={L_m}")
+
         hs_b = text_hidden_states[b][sup_mask[b]]  # (N_b, D)
         if hs_b.shape[0] != expected_tokens:
             # Print helpful debug once
@@ -736,7 +750,7 @@ def save_training_checkpoint(
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
         base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=False
         )
         merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
         merged_vla = merged_vla.merge_and_unload()
@@ -1031,6 +1045,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+
+    import inspect
+    print("[MODEL CLASS]", vla.__class__, flush=True)
+    print("[MODEL FILE ]", inspect.getsourcefile(vla.__class__), flush=True)
+
     
     # replace_action_head_if_shape_mismatch(vla) # no need 
     
@@ -1087,6 +1106,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
 
+    print("[DDP MODEL FILE]", inspect.getsourcefile(vla.module.__class__), flush=True)
+    
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
         proprio_projector = init_module(
@@ -1097,16 +1118,6 @@ def finetune(cfg: FinetuneConfig) -> None:
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
         )
 
-    # # If applicable, instantiate continuous action head for L1 regression
-    # if cfg.use_l1_regression:
-    #     action_head = init_module(
-    #         L1RegressionActionHead,
-    #         "action_head",
-    #         cfg,
-    #         device_id,
-    #         {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
-    #         to_bf16=True,
-    #     )
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
         action_head = init_module(
@@ -1173,22 +1184,6 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
-
-    # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
-    #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
-    #   =>> Note that our training code does not loop over epochs because the RLDS loader does this implicitly; if using
-    #       your own Dataset, make sure to add the appropriate logic to the training loop!
-    #
-    # ---
-    # from prismatic.vla.datasets import DummyDataset
-    #
-    # train_dataset = DummyDataset(
-    #     action_tokenizer,
-    #     processor.tokenizer,
-    #     image_transform=processor.image_processor.apply_transform,
-    #     prompt_builder_fn=PurePromptBuilder,
-    # )
-    # ---
 
     # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
     use_wrist_image = cfg.num_images_in_input > 1
@@ -1380,7 +1375,32 @@ def finetune(cfg: FinetuneConfig) -> None:
             #     vla.train()
             dist_barrier()
             torch.cuda.synchronize()
-                
+            
+            if is_rank0() and (gradient_step_idx % 200 == 0):
+                input_ids = batch["input_ids"]
+                labels = batch.get("labels", None)
+                attn = batch["attention_mask"]
+
+                print("\n[DEBUG BATCH]", flush=True)
+                print(" input_ids:", tuple(input_ids.shape), "attn:", tuple(attn.shape), flush=True)
+                print(" attn_sum[0]:", int(attn[0].sum().item()), flush=True)
+                print(" last 30 ids[0]:", input_ids[0, -30:].tolist(), flush=True)
+
+                if labels is not None:
+                    print(" labels:", tuple(labels.shape), flush=True)
+                    # count non-ignore and stop
+                    non_ign = (labels[0] != IGNORE_INDEX).sum().item()
+                    stop_ct = (labels[0] == STOP_INDEX).sum().item()
+                    print(f" labels non-ignore={non_ign}, STOP count={stop_ct}", flush=True)
+
+            if is_rank0() and (gradient_step_idx % 200 == 0):
+                pv = batch["pixel_values"]  # usually (B, num_images, C, H, W)
+                print(" pixel_values:", tuple(pv.shape), pv.dtype, flush=True)
+                # quick fingerprints
+                m0 = float(pv[0,0].mean().item())
+                m1 = float(pv[0,1].mean().item()) if pv.shape[1] > 1 else None
+                print(f" pixel mean primary={m0:.6f} wrist={m1:.6f}", flush=True)
+
             if is_rank0() and (gradient_step_idx % cfg.save_freq == 0 or gradient_step_idx == 100):
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_step{gradient_step_idx}_{timestamp}_sbs{cfg.shuffle_buffer_size}"
