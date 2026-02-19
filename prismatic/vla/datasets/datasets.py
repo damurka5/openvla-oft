@@ -147,7 +147,7 @@ class RLDSBatchTransform:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name = rlds_batch["dataset_name"]
         
-        print(f'[DEBUG] rlds_batch info: {rlds_batch["observation"]["image_primary"].shape}, {rlds_batch["observation"]["image_primary"].dtype}')
+        # print(f'[DEBUG] rlds_batch info: {rlds_batch["observation"]["image_primary"].shape}, {rlds_batch["observation"]["image_primary"].dtype}')
         
         image_primary_raw = rlds_batch["observation"]["image_primary"]
         if isinstance(image_primary_raw, np.ndarray) and image_primary_raw.ndim == 4:
@@ -215,8 +215,8 @@ class RLDSBatchTransform:
         labels = torch.tensor(labels, dtype=torch.long)
 
 
-        print(f"[DEBUG TOKENS] Total input IDs length: {len(input_ids)}", flush=True)
-        print(f"[DEBUG TOKENS] Base tokenizer vocab size: {self.base_tokenizer.vocab_size}", flush=True)
+        # print(f"[DEBUG TOKENS] Total input IDs length: {len(input_ids)}", flush=True)
+        # print(f"[DEBUG TOKENS] Base tokenizer vocab size: {self.base_tokenizer.vocab_size}", flush=True)
 
         pixel_values = self.image_transform(img)
         return_dict = dict(
@@ -258,7 +258,7 @@ class RLDSBatchTransform:
 
             proprio_tensor = torch.tensor(proprio_processed, dtype=torch.float32).unsqueeze(0)  # (1,5)
             return_dict["proprio"] = proprio_tensor
-            print(f"[DEBUG] Final proprio shape for model: {return_dict['proprio'].shape}", flush=True)
+            # print(f"[DEBUG] Final proprio shape for model: {return_dict['proprio'].shape}", flush=True)
 
         return return_dict
 

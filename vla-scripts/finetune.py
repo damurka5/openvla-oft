@@ -5,7 +5,7 @@ Fine-tunes OpenVLA via LoRA.
 """
 
 import os
-import time
+import time, json
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +88,7 @@ class FinetuneConfig:
     dataset_name: str = "cdpr_synth"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 700 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    stats_path = Path("/root/repo/cdpr_synth_10hz/dataset_statistics.json")
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
@@ -294,6 +295,7 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    dataset_stats=None
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     metrics: Dict[str, float] = {}
 
@@ -317,7 +319,23 @@ def run_forward_pass(
         raise ValueError(f"Expected ground_truth_actions rank 3 or 4, got {ground_truth_actions.shape}")
 
     # Cast for autocast region
-    ground_truth_actions = ground_truth_actions.to(torch.bfloat16)
+    ground_truth_actions = ground_truth_actions.float()
+
+    device = input_ids.device
+    q01 = torch.tensor(dataset_stats["cdpr_local"]["action"]["q01"], dtype=torch.float32, device=device)
+    q99 = torch.tensor(dataset_stats["cdpr_local"]["action"]["q99"], dtype=torch.float32, device=device)
+
+    center = 0.5 * (q01 + q99)
+    scale  = 0.5 * (q99 - q01)
+    scale  = torch.clamp(scale, min=1e-6).to(device)
+
+    def normalize_actions(a):      # a: (...,5)
+        return torch.clamp((a - center) / scale, -1.0, 1.0)
+
+    def denormalize_actions(a_n):  # a_n: (...,5)
+        return a_n * scale + center
+    
+    ground_truth_actions = normalize_actions(ground_truth_actions)
 
     # ---- Diffusion noisy inputs ----
     if use_diffusion:
@@ -329,6 +347,22 @@ def run_forward_pass(
         noise = None
         noisy_actions = None
         diffusion_timestep_embeddings = None
+
+    # pv = batch["pixel_values"]  # (B, 12, H, W) for 2 images
+    # primary = pv[:, :6]
+    # wrist   = pv[:, 6:]
+
+    # def stats(x, name):
+    #     # x is (B,6,H,W)
+    #     s1 = x[:, :3]   # SigLIP half (expected normalized)
+    #     s2 = x[:, 3:6]  # DINO half   (expected normalized)
+    #     print(name,
+    #         "siglip mean/std", float(s1.mean()), float(s1.std()),
+    #         "| dino mean/std", float(s2.mean()), float(s2.std()),
+    #         flush=True)
+
+    # stats(primary, "primary")
+    # stats(wrist,   "wrist")
 
     # ---- VLA forward ----
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -356,7 +390,7 @@ def run_forward_pass(
     if not (use_l1_regression or use_diffusion):
         loss = output.loss
 
-        predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
+        predicted_token_ids = output.logits[:, 1 + num_patches:-1].argmax(dim=2)
         curr_action_accuracy = compute_token_accuracy(
             predicted_token_ids, ground_truth_token_ids, mask=current_action_mask
         )
@@ -401,57 +435,25 @@ def run_forward_pass(
     D = text_hidden_states.shape[-1]
     expected_tokens = NUM_ACTIONS_CHUNK * ACTION_DIM  # 40 for 8*5
 
-    # Supervision mask = exactly positions where labels are not IGNORE (on the shifted axis)
-    sup_mask = ground_truth_token_ids.ne(IGNORE_INDEX)  # (B, L-1)
+    # Token-aligned: action tokens are supervised labels != IGNORE, excluding STOP
+    token_sup = labels.ne(IGNORE_INDEX) & labels.ne(STOP_INDEX)
 
-    # Drop EOS from regression features if it is supervised
-    eos_id = getattr(action_tokenizer.tokenizer, "eos_token_id", None)
-    # Use shifted input_ids (aligned with labels[:,1:])
-    shifted_input_ids = input_ids[:, 1:]
-    if eos_id is not None:
-        sup_mask = sup_mask & shifted_input_ids.ne(eos_id)
-
-    # Gather per-batch to preserve order and avoid flattening surprises
     action_hs_list = []
-    for b in range(batch_size):
-        L_h = text_hidden_states.shape[1]
-        L_m = sup_mask.shape[1]
-        if L_h != L_m:
-            print(f"[ALIGN] text_hidden_states L={L_h}, sup_mask L={L_m}", flush=True)
-
-            # If sup_mask is built from labels[:, 1:], it's prediction-aligned (L-1)
-            # so hidden states must be truncated to L-1 as well:
-            if L_h == L_m + 1:
-                text_hidden_states = text_hidden_states[:, :-1, :]   # drop final position
-            else:
-                # hard fail: unknown mismatch
-                raise RuntimeError(f"Unexpected length mismatch: hidden={L_h}, mask={L_m}")
-
-        hs_b = text_hidden_states[b][sup_mask[b]]  # (N_b, D)
+    for b in range(input_ids.shape[0]):
+        hs_b = text_hidden_states[b][token_sup[b]]  # (N_b, D)
         if hs_b.shape[0] != expected_tokens:
-            # Print helpful debug once
-            n_b = int(hs_b.shape[0])
-            print(
-                f"[run_forward_pass] ERROR: supervised action tokens for batch {b} = {n_b}, "
-                f"expected {expected_tokens}. "
-                f"(eos_dropped={eos_id is not None}).",
-                flush=True,
-            )
-            # Optional: show how many supervised tokens BEFORE eos-drop
-            pre = int(ground_truth_token_ids[b].ne(IGNORE_INDEX).sum().item())
-            print(f"[run_forward_pass] batch {b}: supervised tokens before eos-drop = {pre}", flush=True)
-            # Hard fail so you fix data/labels immediately
-            raise ValueError(
-                f"Supervised action token count mismatch: got {n_b}, expected {expected_tokens}."
-            )
+            raise ValueError(f"Got {hs_b.shape[0]} supervised action tokens, expected {expected_tokens}")
         action_hs_list.append(hs_b)
 
-    actions_hidden_states = torch.stack(action_hs_list, dim=0).to(torch.bfloat16)  # (B, 40, D)
+    actions_hidden_states = torch.stack(action_hs_list, dim=0)  # (B, 40, D)
+
+    # actions_hidden_states = torch.stack(action_hs_list, dim=0).to(torch.bfloat16)  # (B, 40, D)
 
     # --- L1 regression ---
     if use_l1_regression:
-        predicted_actions = action_head.module.predict_action(actions_hidden_states)  # (B, 8, 5)
-        loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+        predicted_actions = action_head.module.predict_action(actions_hidden_states).float()  # (B, 8, 5)
+        predicted_actions = torch.tanh(predicted_actions)
+        loss = torch.nn.SmoothL1Loss(beta=0.05)(ground_truth_actions, predicted_actions)
 
     # --- Diffusion ---
     if use_diffusion:
@@ -1262,6 +1264,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         tb_logdir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(tb_logdir), flush_secs=10)
         print(f"[TensorBoard] Writing events to: {tb_logdir}", flush=True)
+
+    with cfg.stats_path.open("r") as f:
+        dataset_stats = json.load(f)
         
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False, disable=not is_rank0()) as progress:
@@ -1285,6 +1290,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                dataset_stats=dataset_stats
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1376,30 +1382,30 @@ def finetune(cfg: FinetuneConfig) -> None:
             dist_barrier()
             torch.cuda.synchronize()
             
-            if is_rank0() and (gradient_step_idx % 200 == 0):
-                input_ids = batch["input_ids"]
-                labels = batch.get("labels", None)
-                attn = batch["attention_mask"]
+            # if is_rank0() and (gradient_step_idx % 200 == 0):
+            #     input_ids = batch["input_ids"]
+            #     labels = batch.get("labels", None)
+            #     attn = batch["attention_mask"]
 
-                print("\n[DEBUG BATCH]", flush=True)
-                print(" input_ids:", tuple(input_ids.shape), "attn:", tuple(attn.shape), flush=True)
-                print(" attn_sum[0]:", int(attn[0].sum().item()), flush=True)
-                print(" last 30 ids[0]:", input_ids[0, -30:].tolist(), flush=True)
+            #     print("\n[DEBUG BATCH]", flush=True)
+            #     print(" input_ids:", tuple(input_ids.shape), "attn:", tuple(attn.shape), flush=True)
+            #     print(" attn_sum[0]:", int(attn[0].sum().item()), flush=True)
+            #     print(" last 30 ids[0]:", input_ids[0, -30:].tolist(), flush=True)
 
-                if labels is not None:
-                    print(" labels:", tuple(labels.shape), flush=True)
-                    # count non-ignore and stop
-                    non_ign = (labels[0] != IGNORE_INDEX).sum().item()
-                    stop_ct = (labels[0] == STOP_INDEX).sum().item()
-                    print(f" labels non-ignore={non_ign}, STOP count={stop_ct}", flush=True)
+            #     if labels is not None:
+            #         print(" labels:", tuple(labels.shape), flush=True)
+            #         # count non-ignore and stop
+            #         non_ign = (labels[0] != IGNORE_INDEX).sum().item()
+            #         stop_ct = (labels[0] == STOP_INDEX).sum().item()
+            #         print(f" labels non-ignore={non_ign}, STOP count={stop_ct}", flush=True)
 
-            if is_rank0() and (gradient_step_idx % 200 == 0):
-                pv = batch["pixel_values"]  # usually (B, num_images, C, H, W)
-                print(" pixel_values:", tuple(pv.shape), pv.dtype, flush=True)
-                # quick fingerprints
-                m0 = float(pv[0,0].mean().item())
-                m1 = float(pv[0,1].mean().item()) if pv.shape[1] > 1 else None
-                print(f" pixel mean primary={m0:.6f} wrist={m1:.6f}", flush=True)
+            # if is_rank0() and (gradient_step_idx % 200 == 0):
+            #     pv = batch["pixel_values"]  # usually (B, num_images, C, H, W)
+            #     print(" pixel_values:", tuple(pv.shape), pv.dtype, flush=True)
+            #     # quick fingerprints
+            #     m0 = float(pv[0,0].mean().item())
+            #     m1 = float(pv[0,1].mean().item()) if pv.shape[1] > 1 else None
+            #     print(f" pixel mean primary={m0:.6f} wrist={m1:.6f}", flush=True)
 
             if is_rank0() and (gradient_step_idx % cfg.save_freq == 0 or gradient_step_idx == 100):
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
