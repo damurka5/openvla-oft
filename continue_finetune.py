@@ -2,6 +2,8 @@
 import os
 import sys
 import torch
+import json
+from pathlib import Path
 
 # Add the repo to path
 sys.path.insert(0, '/root/repo/openvla-oft')
@@ -12,8 +14,8 @@ import finetune as finetune_module
 from finetune import *
 
 # Paths to your existing checkpoints
-ADAPTER_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step60000_20260208-011658_sbs700/vla_cdpr_adapter"
-ACTION_HEAD_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step60000_20260208-011658_sbs700/action_head_cdpr.pt"
+ADAPTER_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step10000_20260220-013512_sbs700/vla_cdpr_adapter"
+ACTION_HEAD_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step10000_20260220-013512_sbs700/action_head_cdpr.pt"
 
 # Save the original load_checkpoint function
 original_load_checkpoint = load_checkpoint
@@ -306,7 +308,12 @@ def patched_finetune(cfg: FinetuneConfig) -> None:
         tb_logdir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(tb_logdir), flush_secs=10)
         print(f"[TensorBoard] Writing events to: {tb_logdir}", flush=True)
-        
+    
+    dataset_stats = None
+    stats_path = Path("/root/repo/cdpr_synth_10hz/dataset_statistics.json")
+    with stats_path.open("r") as f:
+        dataset_stats = json.load(f)
+
     with tqdm.tqdm(total=cfg.max_steps, leave=False, disable=not is_rank0()) as progress:
         vla.train()
         optimizer.zero_grad()
@@ -327,6 +334,7 @@ def patched_finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                dataset_stats=dataset_stats
             )
 
             normalized_loss = loss / cfg.grad_accumulation_steps

@@ -18,8 +18,8 @@ def main() -> int:
     os.environ["WANDB_SILENT"] = "true"
     
     # Paths to your existing checkpoints
-    ADAPTER_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step60000_20260208-011658_sbs700/vla_cdpr_adapter"
-    ACTION_HEAD_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step60000_20260208-011658_sbs700/action_head_cdpr.pt"
+    ADAPTER_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step10000_20260220-013512_sbs700/vla_cdpr_adapter"
+    ACTION_HEAD_PATH = "/root/repo/VLA_CDPR/oft_cdpr_ckpts/cdpr_finetune_step10000_20260220-013512_sbs700/action_head_cdpr.pt"
         
     print("=" * 60)
     print("CONTINUING TRAINING FROM EXISTING CHECKPOINT")

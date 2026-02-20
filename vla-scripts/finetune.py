@@ -295,7 +295,8 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
-    dataset_stats=None
+    dataset_stats=None,
+    debug_step: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     metrics: Dict[str, float] = {}
 
@@ -320,6 +321,7 @@ def run_forward_pass(
 
     # Cast for autocast region
     ground_truth_actions = ground_truth_actions.float()
+    raw_actions = ground_truth_actions
 
     device = input_ids.device
     q01 = torch.tensor(dataset_stats["cdpr_local"]["action"]["q01"], dtype=torch.float32, device=device)
@@ -347,22 +349,6 @@ def run_forward_pass(
         noise = None
         noisy_actions = None
         diffusion_timestep_embeddings = None
-
-    # pv = batch["pixel_values"]  # (B, 12, H, W) for 2 images
-    # primary = pv[:, :6]
-    # wrist   = pv[:, 6:]
-
-    # def stats(x, name):
-    #     # x is (B,6,H,W)
-    #     s1 = x[:, :3]   # SigLIP half (expected normalized)
-    #     s2 = x[:, 3:6]  # DINO half   (expected normalized)
-    #     print(name,
-    #         "siglip mean/std", float(s1.mean()), float(s1.std()),
-    #         "| dino mean/std", float(s2.mean()), float(s2.std()),
-    #         flush=True)
-
-    # stats(primary, "primary")
-    # stats(wrist,   "wrist")
 
     # ---- VLA forward ----
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -430,13 +416,13 @@ def run_forward_pass(
         f"text_hidden_states len {text_hidden_states.shape[1]} != input_ids len {batch['input_ids'].shape[1]}"
     )
 
-
     batch_size = input_ids.shape[0]
     D = text_hidden_states.shape[-1]
     expected_tokens = NUM_ACTIONS_CHUNK * ACTION_DIM  # 40 for 8*5
 
     # Token-aligned: action tokens are supervised labels != IGNORE, excluding STOP
     token_sup = labels.ne(IGNORE_INDEX) & labels.ne(STOP_INDEX)
+
 
     action_hs_list = []
     for b in range(input_ids.shape[0]):
@@ -446,13 +432,10 @@ def run_forward_pass(
         action_hs_list.append(hs_b)
 
     actions_hidden_states = torch.stack(action_hs_list, dim=0)  # (B, 40, D)
-
-    # actions_hidden_states = torch.stack(action_hs_list, dim=0).to(torch.bfloat16)  # (B, 40, D)
-
-    # --- L1 regression ---
+    
     if use_l1_regression:
-        predicted_actions = action_head.module.predict_action(actions_hidden_states).float()  # (B, 8, 5)
-        predicted_actions = torch.tanh(predicted_actions)
+        pred_pre = action_head.module.predict_action(actions_hidden_states).float()  # pre-tanh
+        predicted_actions = torch.tanh(pred_pre) # was /2 for first 10k steps
         loss = torch.nn.SmoothL1Loss(beta=0.05)(ground_truth_actions, predicted_actions)
 
     # --- Diffusion ---
@@ -1251,12 +1234,13 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
-        "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
-        "curr_action_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
-        "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
-        "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
-        "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
-    }
+         "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
+         "curr_action_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
+         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
+         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps)
+     }
+
 
     tb_writer = None
     if is_rank0():
@@ -1273,6 +1257,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
+            # Compute gradient step index
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics = run_forward_pass(
@@ -1290,7 +1277,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
-                dataset_stats=dataset_stats
+                dataset_stats=dataset_stats,
+                debug_step=gradient_step_idx,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1304,8 +1292,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 if metric_name in recent_metrics:
                     recent_metrics[metric_name].append(value)
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+            
 
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
@@ -1341,6 +1328,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()

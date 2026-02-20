@@ -481,10 +481,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 [attention_mask[:, :1], projected_patch_attention_mask, attention_mask[:, 1:]], dim=1
             )
             
-        print("[DEBUG MM] input_embeddings:", tuple(input_embeddings.shape), flush=True)
-        print("[DEBUG MM] patch_embeddings:", tuple(projected_patch_embeddings.shape), flush=True)
-        print("[DEBUG MM] multimodal_embeddings:", tuple(multimodal_embeddings.shape), flush=True)
-        print("[DEBUG MM] multimodal_attention_mask:", tuple(multimodal_attention_mask.shape), flush=True)
+        # print("[DEBUG MM] input_embeddings:", tuple(input_embeddings.shape), flush=True)
+        # print("[DEBUG MM] patch_embeddings:", tuple(projected_patch_embeddings.shape), flush=True)
+        # print("[DEBUG MM] multimodal_embeddings:", tuple(multimodal_embeddings.shape), flush=True)
+        # print("[DEBUG MM] multimodal_attention_mask:", tuple(multimodal_attention_mask.shape), flush=True)
 
         return multimodal_embeddings, multimodal_attention_mask
 
@@ -958,15 +958,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Slice action-token region in TEXT space
         actions_hidden_states = text_hidden_states[:, prompt_len : prompt_len + A, :]  # (B, A, D)
 
-        if torch.distributed.get_rank() == 0 and (torch.rand(()) < 0.01):
-            ah = actions_hidden_states
-            print("[DEBUG ACTION_HS] shape:", tuple(ah.shape), flush=True)
-            print("[DEBUG ACTION_HS] mean/std:", float(ah.mean()), float(ah.std()), flush=True)
+        # if torch.distributed.get_rank() == 0 and (torch.rand(()) < 0.01):
+        #     ah = actions_hidden_states
+        #     print("[DEBUG ACTION_HS] shape:", tuple(ah.shape), flush=True)
+        #     print("[DEBUG ACTION_HS] mean/std:", float(ah.mean()), float(ah.std()), flush=True)
 
-            # if batch > 1: compare sample 0 vs 1
-            if ah.shape[0] > 1:
-                diff = (ah[0] - ah[1]).abs().mean()
-                print("[DEBUG ACTION_HS] |hs0-hs1| mean:", float(diff), flush=True)
+        #     # if batch > 1: compare sample 0 vs 1
+        #     if ah.shape[0] > 1:
+        #         diff = (ah[0] - ah[1]).abs().mean()
+        #         print("[DEBUG ACTION_HS] |hs0-hs1| mean:", float(diff), flush=True)
 
         if action_head is not None:
             # L1 regression prediction
@@ -1062,10 +1062,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Process vision features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
         
-        if torch.distributed.get_rank() == 0 and (torch.rand(()) < 0.01):  # ~1% of calls
-            p = projected_patch_embeddings
-            print("[DEBUG PATCH] projected_patch_embeddings:", tuple(p.shape), flush=True)
-            print("[DEBUG PATCH] mean/std:", float(p.mean()), float(p.std()), flush=True)
+        # if torch.distributed.get_rank() == 0 and (torch.rand(()) < 0.01):  # ~1% of calls
+        #     p = projected_patch_embeddings
+        #     print("[DEBUG PATCH] projected_patch_embeddings:", tuple(p.shape), flush=True)
+        #     print("[DEBUG PATCH] mean/std:", float(p.mean()), float(p.std()), flush=True)
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
