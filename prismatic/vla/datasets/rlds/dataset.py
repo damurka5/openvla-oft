@@ -119,55 +119,49 @@ class _DLAdapter:
         return iter(self._ds)
 
 # Try to import the real class; otherwise use the shim
+# ---- DLimp DLataset helpers ----
+# We want to use the *real* dlimp.dataset.DLataset so that:
+#   - `.flatten()` exists
+#   - `.traj_map` / `.frame_map` exist
+#   - `DLataset.sample_from_datasets(...)` accepts our datasets (it checks isinstance)
 def _get_dlatset_cls():
+    """Return the real dlimp.dataset.DLataset if available; otherwise fall back to _DLAdapter."""
     try:
-        from prismatic.util.data_utils import DLataset  # most repos
-        return DLataset
+        from dlimp.dataset import DLataset as _DLDataset
+        return _DLDataset
     except Exception:
+        # Some installs expose it at top-level `dlimp.DLataset`
         try:
-            from prismatic.vla.util.data_utils import DLataset  # some forks
-            return DLataset
+            import dlimp as _dl
+            if hasattr(_dl, "DLataset"):
+                return _dl.DLataset
         except Exception:
-            return _DLAdapter
+            pass
+        return _DLAdapter
 
 
 def _ensure_dldataset(ds):
+    """Ensure `ds` is a dlimp DLataset (so it has traj_map/frame_map/flatten and works with sample_from_datasets)."""
     DLataset = _get_dlatset_cls()
+
+    # unwrap our shim, if present
+    if isinstance(ds, _DLAdapter) and DLataset is not _DLAdapter:
+        ds = ds._ds
+
     if isinstance(ds, DLataset):
         return ds
 
+    # Convert a raw tf.data.Dataset into a DLataset by monkey-patching its class.
+    # This is the same trick dlimp uses internally in `_wrap(...)`.
+    if isinstance(ds, tf.data.Dataset) and DLataset is not _DLAdapter:
+        ds.__class__ = type("DLataset", (DLataset, type(ds)), DLataset.__dict__.copy())
+        ds.is_flattened = getattr(ds, "is_flattened", False)
+        return ds
+
     if isinstance(ds, tf.data.Dataset):
-        elem_spec = ds.element_spec
-        def _gen():
-            for item in ds:
-                yield item
-        return DLataset.from_generator(_gen, output_signature=elem_spec)
+        return _DLAdapter(ds)
 
-    # As a last resort: try to build a signature from the first element
-    it = iter(ds)
-    first = next(it)
-
-    def _to_spec(x):
-        if isinstance(x, tf.Tensor):
-            return tf.TensorSpec(shape=x.shape, dtype=x.dtype)
-        if isinstance(x, (bytes, str)):
-            return tf.TensorSpec(shape=(), dtype=tf.string)
-        if isinstance(x, float):
-            return tf.TensorSpec(shape=(), dtype=tf.float32)
-        if isinstance(x, int):
-            return tf.TensorSpec(shape=(), dtype=tf.int32)
-        if isinstance(x, dict):
-            return {k: _to_spec(v) for k, v in x.items()}
-        if isinstance(x, (list, tuple)):
-            return type(x)(_to_spec(v) for v in x)
-        raise TypeError(f"Unsupported element type: {type(x)}")
-
-    spec = _to_spec(first)
-    def _peeking_gen():
-        yield first
-        for x in it:
-            yield x
-    return DLataset.from_generator(_peeking_gen, output_signature=spec)
+    raise TypeError(f"Unsupported dataset type: {type(ds)}")
 
 # ruff: noqa: B006
 def make_dataset_from_rlds(
@@ -471,6 +465,78 @@ def apply_trajectory_transforms(
     )
     dataset = _ensure_dldataset(dataset)
 
+    def _ensure_len_n_bool_2d(pm, n):
+        """Return bool tensor shaped (n, 1)."""
+        pm = tf.convert_to_tensor(pm)
+        pm = tf.cast(pm, tf.bool)
+        pm = tf.reshape(pm, [-1])  # 1D
+
+        # Guard so pm0 is always safe
+        pm = tf.concat([pm, tf.ones([1], tf.bool)], axis=0)
+        pm0 = pm[0]  # scalar bool
+
+        # if length matches n (ignoring guard), keep; else broadcast pm0
+        vec = tf.cond(
+            tf.equal(tf.shape(pm)[0] - 1, n),
+            lambda: pm[:-1],
+            lambda: tf.fill([n], pm0),
+        )
+        return tf.reshape(vec, [n, 1])  # <-- critical: (n,1)
+
+    def _prune_and_align_for_flatten(traj):
+        action = traj["action"]
+        n = tf.shape(action)[0]
+
+        obs = traj["observation"]
+        out = {"action": action, "observation": {}}
+
+        if "image_primary" in obs:
+            out["observation"]["image_primary"] = obs["image_primary"][:n]
+        if "image_wrist" in obs:
+            out["observation"]["image_wrist"] = obs["image_wrist"][:n]
+        if "proprio" in obs:
+            out["observation"]["proprio"] = obs["proprio"][:n]
+
+        # ---- FIX: pad_mask_dict must exist and be (n,1) so after flatten it becomes (1,) ----
+        img_keys = []
+        if "image_primary" in obs: img_keys.append("image_primary")
+        if "image_wrist" in obs:   img_keys.append("image_wrist")
+
+        src_pad_dict = obs.get("pad_mask_dict", {})
+        pad_dict = {}
+        for k in img_keys:
+            if isinstance(src_pad_dict, dict) and (k in src_pad_dict):
+                pad_dict[k] = _ensure_len_n_bool_2d(src_pad_dict[k], n)
+            elif "pad_mask" in obs:
+                pad_dict[k] = _ensure_len_n_bool_2d(obs["pad_mask"], n)
+            else:
+                pad_dict[k] = tf.ones([n, 1], tf.bool)
+
+        out["observation"]["pad_mask_dict"] = pad_dict
+
+        # optional, but keeps structure consistent:
+        if "pad_mask" in obs:
+            out["observation"]["pad_mask"] = _ensure_len_n_bool_2d(obs["pad_mask"], n)
+
+        # task + dataset_name broadcasting (keep as (n,), that’s fine)
+        task = traj.get("task", {})
+        lang = task.get("language_instruction", tf.constant("", tf.string))
+        lang = tf.reshape(tf.convert_to_tensor(lang), [-1])
+        lang0 = tf.concat([lang, tf.constant([""], tf.string)], axis=0)[0]
+        out["task"] = {"language_instruction": tf.fill([n], lang0)}
+
+        dsn = traj.get("dataset_name", tf.constant("unknown", tf.string))
+        dsn = tf.reshape(tf.convert_to_tensor(dsn), [-1])
+        dsn0 = tf.concat([dsn, tf.constant(["unknown"], tf.string)], axis=0)[0]
+        out["dataset_name"] = tf.fill([n], dsn0)
+
+        return out
+
+
+    dataset = dataset.traj_map(_prune_and_align_for_flatten, num_parallel_calls=num_parallel_calls)
+    dataset = dataset.filter(lambda traj: tf.greater(tf.shape(traj["action"])[0], 0))
+
+
     # 5) subsample (train only)
     if train and subsample_length is not None:
         dataset = dataset.traj_map(
@@ -582,14 +648,13 @@ def apply_frame_transforms(
         image_names = ["image_primary", "image_wrist"]
 
     def _maybe_squeeze_rank2_strings(x):
-        # Your batches show shapes like (340,1). For tf.string, squeeze trailing singleton.
-        # Only squeeze if rank==2 and last dim==1; keep other tensors unchanged.
+        # safe for (), (1,), (1,1), (T,1), etc.
         x = tf.convert_to_tensor(x)
-        return tf.cond(
-            tf.logical_and(tf.equal(tf.rank(x), 2), tf.equal(tf.shape(x)[-1], 1)),
-            lambda: tf.squeeze(x, axis=-1),
-            lambda: x,
-        )
+        x = tf.squeeze(x)
+        # ensure scalar if exactly one element
+        return tf.cond(tf.equal(tf.size(x), 1),
+                    lambda: tf.reshape(x, []),
+                    lambda: x)
 
     def _squeeze_singletons(frame):
         obs = frame["observation"]
@@ -895,7 +960,10 @@ def make_interleaved_dataset(
             train=train,
         )
         dataset = trace_image_processing(dataset, "AFTER_TRAJECTORY_TRANSFORMS")
-        
+
+        # IMPORTANT: convert trajectories -> per-timestep frame samples (sliding-window chunks)
+        dataset = dataset.flatten(num_parallel_calls=threads)
+
         def debug_after_traj_transforms(x):
             print(f"[AFTER TRAJ TRANSFORMS] Batch keys: {list(x.keys())}", flush=True)
             if 'observation' in x:
@@ -1172,9 +1240,9 @@ def make_dataset_from_tfrecord_globs(
             }
 
     # 3) Build a DLataset directly from the generator (NO tf.data anywhere)
-    dl_dataset = DLataset.from_generator(
-    episode_generator,
-    output_signature={
+    
+    # 3) Build a tf.data.Dataset from the generator and convert it into a dlimp DLataset
+    output_signature = {
         "observation": {
             "image_primary": tf.TensorSpec(shape=(None,), dtype=tf.string),
             "image_wrist":   tf.TensorSpec(shape=(None,), dtype=tf.string),
@@ -1193,9 +1261,9 @@ def make_dataset_from_tfrecord_globs(
         # "dataset_name": tf.TensorSpec(shape=(), dtype=tf.string),
         "dataset_name": tf.TensorSpec(shape=(None,), dtype=tf.string),
 
-    },
-)
-
+    }
+    tf_ds = tf.data.Dataset.from_generator(episode_generator, output_signature=output_signature)
+    dl_dataset = _ensure_dldataset(tf_ds)
 
     # 4) Cheap stats …
     num_transitions = 0

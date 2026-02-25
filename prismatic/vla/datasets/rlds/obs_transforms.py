@@ -36,7 +36,13 @@ def augment(obs: Dict, seed: tf.Tensor, augment_kwargs: Union[Dict, Dict[str, Di
         img_key = f"image_{name}"
 
         img = obs[img_key]
-        pm = obs["pad_mask_dict"][img_key]  # "True" means real (non-padding), per your original logic
+        # pm = obs["pad_mask_dict"][img_key]  # "True" means real (non-padding), per your original logic
+        pm = obs.get("pad_mask_dict", {}).get(img_key, None)
+        if pm is None:
+            # assume non-padding everywhere
+            # for a single frame sample, you can just use True
+            pm = True
+
         pm = tf.cast(pm, tf.bool)
 
         # Create a stateless seed of shape [2] for this image stream

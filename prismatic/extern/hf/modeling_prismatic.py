@@ -976,7 +976,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         else:
             # Discrete token prediction: convert logits to TEXT-aligned logits too
             logits = language_model_output.logits  # (B, 1+P+(L-1), vocab)
-            text_logits = torch.cat([logits[:, :1, :], logits[:, 1 + P :, :]], dim=1)  # (B, L, vocab)
+            text_logits = torch.cat([logits[:, :1, :], logits[:, 1 + P_actual :, :]], dim=1)  # (B, L, vocab)
 
             predicted_action_token_ids = text_logits[:, prompt_len : prompt_len + A, :].argmax(dim=2).cpu().numpy()
             discretized_actions = self.vocab_size - predicted_action_token_ids

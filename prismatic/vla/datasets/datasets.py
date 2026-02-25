@@ -149,6 +149,10 @@ class RLDSBatchTransform:
         
         # print(f'[DEBUG] rlds_batch info: {rlds_batch["observation"]["image_primary"].shape}, {rlds_batch["observation"]["image_primary"].dtype}')
         
+        actions = rlds_batch["action"]
+        if actions.shape[0] != NUM_ACTIONS_CHUNK:
+            raise ValueError(f"Expected action chunk (8,5), got {actions.shape} — dataset not flattened?")
+
         image_primary_raw = rlds_batch["observation"]["image_primary"]
         if isinstance(image_primary_raw, np.ndarray) and image_primary_raw.ndim == 4:
             image_primary_raw = image_primary_raw[-1]  # current frame

@@ -87,7 +87,7 @@ class FinetuneConfig:
     data_root_dir: Path = Path("datasets/rlds")    # Directory containing RLDS datasets
     dataset_name: str = "cdpr_synth"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
-    shuffle_buffer_size: int = 700 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    shuffle_buffer_size: int = 50_000 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
     stats_path = Path("/root/repo/cdpr_synth_10hz/dataset_statistics.json")
 
     # Algorithm and architecture
@@ -435,7 +435,7 @@ def run_forward_pass(
     
     if use_l1_regression:
         pred_pre = action_head.module.predict_action(actions_hidden_states).float()  # pre-tanh
-        predicted_actions = torch.tanh(pred_pre) # was /2 for first 10k steps
+        predicted_actions = torch.tanh(pred_pre/2) # was /2 for first 10k steps
         loss = torch.nn.SmoothL1Loss(beta=0.05)(ground_truth_actions, predicted_actions)
 
     # --- Diffusion ---
