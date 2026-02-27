@@ -87,7 +87,7 @@ class FinetuneConfig:
     data_root_dir: Path = Path("datasets/rlds")    # Directory containing RLDS datasets
     dataset_name: str = "cdpr_synth"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
-    shuffle_buffer_size: int = 50_000 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
+    shuffle_buffer_size: int = 50000 #100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
     stats_path = Path("/root/repo/cdpr_synth_10hz/dataset_statistics.json")
 
     # Algorithm and architecture
@@ -321,23 +321,30 @@ def run_forward_pass(
 
     # Cast for autocast region
     ground_truth_actions = ground_truth_actions.float()
-    raw_actions = ground_truth_actions
 
     device = input_ids.device
-    q01 = torch.tensor(dataset_stats["cdpr_local"]["action"]["q01"], dtype=torch.float32, device=device)
-    q99 = torch.tensor(dataset_stats["cdpr_local"]["action"]["q99"], dtype=torch.float32, device=device)
 
-    center = 0.5 * (q01 + q99)
-    scale  = 0.5 * (q99 - q01)
-    scale  = torch.clamp(scale, min=1e-6).to(device)
+    # Keep raw (for metrics / debug if you want)
+    ground_truth_actions_raw = ground_truth_actions.float()
+
+    # ---- Robust symmetric scaling for delta-actions ----
+    stats = dataset_stats["cdpr_local"]["action"]
+    q01 = torch.tensor(stats["q01"], dtype=torch.float32, device=device)  # shape (5,)
+    q99 = torch.tensor(stats["q99"], dtype=torch.float32, device=device)  # shape (5,)
+
+    # For deltas: center should be 0. Use max-abs so distribution maps nicely to [-1, 1].
+    # scale = torch.maximum(q01.abs(), q99.abs())  # shape (5,)
+    # scale = torch.where(scale < 1e-6, torch.ones_like(scale), scale)  # avoid tiny scales
+    scale = torch.tensor([0.0025, 0.0025, 0.0025, 1.0, 1.0], device=device)
 
     def normalize_actions(a):      # a: (...,5)
-        return torch.clamp((a - center) / scale, -1.0, 1.0)
+        return torch.clamp(a / scale, -1.0, 1.0)
 
     def denormalize_actions(a_n):  # a_n: (...,5)
-        return a_n * scale + center
-    
-    ground_truth_actions = normalize_actions(ground_truth_actions)
+        return a_n * scale
+
+    # This is what you feed to regression/diffusion losses
+    ground_truth_actions = normalize_actions(ground_truth_actions_raw)
 
     # ---- Diffusion noisy inputs ----
     if use_diffusion:
@@ -435,7 +442,8 @@ def run_forward_pass(
     
     if use_l1_regression:
         pred_pre = action_head.module.predict_action(actions_hidden_states).float()  # pre-tanh
-        predicted_actions = torch.tanh(pred_pre/2) # was /2 for first 10k steps
+        predicted_actions = torch.tanh(pred_pre) # was /2 for first 10k steps
+
         loss = torch.nn.SmoothL1Loss(beta=0.05)(ground_truth_actions, predicted_actions)
 
     # --- Diffusion ---
@@ -1281,6 +1289,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 debug_step=gradient_step_idx,
             )
 
+
             # Normalize loss to account for gradient accumulation
             normalized_loss = loss / cfg.grad_accumulation_steps
 
@@ -1395,7 +1404,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             #     m1 = float(pv[0,1].mean().item()) if pv.shape[1] > 1 else None
             #     print(f" pixel mean primary={m0:.6f} wrist={m1:.6f}", flush=True)
 
-            if is_rank0() and (gradient_step_idx % cfg.save_freq == 0 or gradient_step_idx == 100):
+            if is_rank0() and (gradient_step_idx % cfg.save_freq == 0):
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 ckpt_dir = Path(cfg.run_root_dir) / f"cdpr_finetune_step{gradient_step_idx}_{timestamp}_sbs{cfg.shuffle_buffer_size}"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)

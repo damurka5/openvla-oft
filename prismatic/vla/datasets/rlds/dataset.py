@@ -28,6 +28,9 @@ from prismatic.vla.datasets.rlds.utils.data_utils import (
     tree_map,
 )
 
+import os
+DEBUG_DATASET = os.environ.get("VLA_DEBUG_DATASET", "0") == "1"
+
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
@@ -400,22 +403,16 @@ def apply_trajectory_transforms(
     
     import tensorflow as tf
     def _ensure_abs_mask(traj):
+        if "absolute_action_mask" in traj:
+            return traj
         T = tf.shape(traj["action"])[0]
         A = tf.shape(traj["action"])[-1]
-        # Most robots use relative actions => absolute mask = False
         traj["absolute_action_mask"] = tf.zeros([T, A], dtype=tf.bool)
         return traj
 
+
     dataset = dataset.traj_map(_ensure_abs_mask, num_parallel_calls)
     
-    if not (hasattr(dataset, "traj_map") and hasattr(dataset, "frame_map")):
-        def _gen():
-            for x in dataset:
-                yield x
-        # Minimal signature to satisfy TF
-        sig = tf.TensorSpec(shape=(), dtype=tf.float32)
-        dataset = dl.DLataset.from_generator(_gen, output_signature=sig)
-        
     # force-disable the problematic branch and coerce type up front
     skip_unlabeled = False
     dataset = _ensure_dldataset(dataset)
@@ -465,23 +462,40 @@ def apply_trajectory_transforms(
     )
     dataset = _ensure_dldataset(dataset)
 
-    def _ensure_len_n_bool_2d(pm, n):
-        """Return bool tensor shaped (n, 1)."""
-        pm = tf.convert_to_tensor(pm)
-        pm = tf.cast(pm, tf.bool)
-        pm = tf.reshape(pm, [-1])  # 1D
+    def _ensure_pad_mask_like(pm, like_tensor, n):
+        """Return a bool pad mask with the SAME shape as `like_tensor` on its leading dims."""
+        like_tensor = tf.convert_to_tensor(like_tensor)
+        pm = tf.cast(tf.convert_to_tensor(pm), tf.bool)
 
-        # Guard so pm0 is always safe
-        pm = tf.concat([pm, tf.ones([1], tf.bool)], axis=0)
-        pm0 = pm[0]  # scalar bool
+        rank = tf.rank(like_tensor)
 
-        # if length matches n (ignoring guard), keep; else broadcast pm0
-        vec = tf.cond(
-            tf.equal(tf.shape(pm)[0] - 1, n),
-            lambda: pm[:-1],
-            lambda: tf.fill([n], pm0),
+        # We only expect (n,) or (n,w) at this point (strings pre-decode).
+        w = tf.cond(
+            tf.equal(rank, 2),
+            lambda: tf.shape(like_tensor)[1],
+            lambda: tf.constant(1, tf.int32),
         )
-        return tf.reshape(vec, [n, 1])  # <-- critical: (n,1)
+        target_len = tf.cond(
+            tf.equal(rank, 2),
+            lambda: n * w,
+            lambda: n,
+        )
+
+        pm_flat = tf.reshape(pm, [-1])
+        pm_flat = tf.concat([pm_flat, tf.ones([1], tf.bool)], axis=0)  # guard
+        pm0 = pm_flat[0]
+
+        vec = tf.cond(
+            tf.equal(tf.shape(pm_flat)[0] - 1, target_len),
+            lambda: pm_flat[:-1],
+            lambda: tf.fill([target_len], pm0),
+        )
+
+        return tf.cond(
+            tf.equal(rank, 2),
+            lambda: tf.reshape(vec, [n, w]),
+            lambda: tf.reshape(vec, [n]),
+        )
 
     def _prune_and_align_for_flatten(traj):
         action = traj["action"]
@@ -505,18 +519,19 @@ def apply_trajectory_transforms(
         src_pad_dict = obs.get("pad_mask_dict", {})
         pad_dict = {}
         for k in img_keys:
+            like = out["observation"][k]
             if isinstance(src_pad_dict, dict) and (k in src_pad_dict):
-                pad_dict[k] = _ensure_len_n_bool_2d(src_pad_dict[k], n)
+                pad_dict[k] = _ensure_pad_mask_like(src_pad_dict[k], like, n)
             elif "pad_mask" in obs:
-                pad_dict[k] = _ensure_len_n_bool_2d(obs["pad_mask"], n)
+                pad_dict[k] = _ensure_pad_mask_like(obs["pad_mask"], like, n)
             else:
-                pad_dict[k] = tf.ones([n, 1], tf.bool)
+                pad_dict[k] = tf.ones(tf.shape(like), tf.bool)
 
         out["observation"]["pad_mask_dict"] = pad_dict
 
-        # optional, but keeps structure consistent:
+        # Keep a trajectory-level pad_mask as (n,) if you want it:
         if "pad_mask" in obs:
-            out["observation"]["pad_mask"] = _ensure_len_n_bool_2d(obs["pad_mask"], n)
+            out["observation"]["pad_mask"] = tf.reshape(tf.cast(obs["pad_mask"][:n], tf.bool), [n])
 
         # task + dataset_name broadcasting (keep as (n,), that’s fine)
         task = traj.get("task", {})
@@ -570,12 +585,25 @@ def custom_decode_and_resize(obs, resize_size=None):
 
     def _decode_one(encoded, size_hw):
         encoded = tf.reshape(encoded, [])  # scalar string
-        img = tf.io.decode_image(encoded, channels=3, expand_animations=False)
-        img = tf.image.convert_image_dtype(img, tf.float32)
-        if size_hw is not None:
-            img = tf.image.resize(img, size_hw, method="lanczos3", antialias=True)
-            img.set_shape([size_hw[0], size_hw[1], 3])
-        return img
+
+        # Handle empty padding strings safely
+        if size_hw is None:
+            size_hw = (224, 224)  # fallback
+        h, w = size_hw[0], size_hw[1]
+
+        is_empty = tf.equal(tf.strings.length(encoded), 0)
+
+        def _zeros():
+            return tf.zeros([h, w, 3], tf.float32)
+
+        def _decode():
+            img = tf.io.decode_image(encoded, channels=3, expand_animations=False)
+            img = tf.image.convert_image_dtype(img, tf.float32)
+            img = tf.image.resize(img, (h, w), method="lanczos3", antialias=True)
+            img.set_shape([h, w, 3])
+            return img
+
+        return tf.cond(is_empty, _zeros, _decode)
 
     for k in image_keys:
         if k not in obs or obs[k] is None:
@@ -838,27 +866,31 @@ def make_interleaved_dataset(
         
         print(f"[DEBUG] Final state_obs_key for dataset: {state_obs_key}", flush=True)
         
+        name = dataset_kwargs.get("name", "unnamed")
+
         if "tfrecord_globs" in dataset_kwargs:
             ds, stats = make_dataset_from_tfrecord_globs(
                 tfrecord_globs=dataset_kwargs["tfrecord_globs"],
                 image_obs_keys=dataset_kwargs.get("image_obs_keys", {}),
-                state_obs_key=state_obs_key,  # Pass the extracted key
+                state_obs_key=state_obs_key,
                 language_key=dataset_kwargs.get("language_key"),
                 action_key=dataset_kwargs.get("action_key"),
                 action_stats=(dataset_kwargs.get("aux_kwargs", {}) or {}).get("action_stats"),
                 train=train,
                 shuffle_buffer_size=shuffle_buffer_size,
                 base_dir=dataset_kwargs.get("data_root_dir") or None,
-                dataset_name=dataset_kwargs.get("name", "cdpr_local"),
+                dataset_name=name,
             )
-        # ds = _ensure_dldataset(ds)
-        # stats_list.append(stats)
-        # all_dataset_statistics[dataset_kwargs["name"]] = stats
-        # dataset_sizes.append(int(stats.get("num_transitions", 0)))
+        else:
+            ds, stats = make_dataset_from_rlds(
+                **dataset_kwargs,
+                train=train,
+            )
+
         ds = _ensure_dldataset(ds)
         norm_stats = _normalize_stats_for_saver(stats)
         stats_list.append(norm_stats)
-        all_dataset_statistics[dataset_kwargs["name"]] = norm_stats
+        all_dataset_statistics[name] = norm_stats
         dataset_sizes.append(int(norm_stats.get("num_transitions", 0)))
 
     # Keep a copy of the pre-normalization weights to define "primary" datasets
@@ -920,7 +952,7 @@ def make_interleaved_dataset(
             dataset, dataset_statistics = make_dataset_from_tfrecord_globs(
                 tfrecord_globs=dataset_kwargs["tfrecord_globs"],
                 image_obs_keys=dataset_kwargs.get("image_obs_keys", {}),
-                state_obs_key=dataset_kwargs.get("state_obs_keys"),
+                state_obs_key=state_obs_key,
                 language_key=dataset_kwargs.get("language_key"),
                 action_key=dataset_kwargs.get("action_key"),
                 action_stats=(dataset_kwargs.get("aux_kwargs", {}) or {}).get("action_stats"),
@@ -1020,9 +1052,10 @@ def make_interleaved_dataset(
             return False
 
     # Test before frame transforms
-    print("[DEBUG] Testing dataset before frame transforms...", flush=True)
-    success = test_single_batch(dataset)
-    print(f"[DEBUG] Before frame transforms test: {success}", flush=True)
+    if DEBUG_DATASET:
+        print("[DEBUG] Testing dataset before frame transforms...", flush=True)
+        success = test_single_batch(dataset)
+        print(f"[DEBUG] Before frame transforms test: {success}", flush=True)
 
     # if success:
     #     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
@@ -1077,7 +1110,8 @@ def make_interleaved_dataset(
         return dataset.frame_map(print_frame_info)
 
     # Use it before applying transforms
-    dataset = debug_frame_structure(dataset)
+    if DEBUG_DATASET:
+        dataset = debug_frame_structure(dataset)
     
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
     # [Contract] When training VLA Policies, we let the Collator handle Batching!

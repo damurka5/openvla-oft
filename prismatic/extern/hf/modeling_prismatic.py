@@ -622,6 +622,13 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             else:
                 # Replace the embeddings of the action tokens with zeros
                 # (Later on, the positional embeddings will be added to them)
+                # all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+                
+                # input_embeddings = input_embeddings * ~all_actions_mask
+                # Replace the embeddings of the action tokens with zeros
+                # (Later on, the positional embeddings will be added to them)
+                mask_bool = all_actions_mask  # (B, seq_len) bool
+              
                 all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
                 input_embeddings = input_embeddings * ~all_actions_mask
 
@@ -968,11 +975,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         #         diff = (ah[0] - ah[1]).abs().mean()
         #         print("[DEBUG ACTION_HS] |hs0-hs1| mean:", float(diff), flush=True)
 
+
         if action_head is not None:
             # L1 regression prediction
-            normalized_actions = action_head.predict_action(actions_hidden_states)  # expects (B, A, D)
-            normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+            # normalized_actions = action_head.predict_action(actions_hidden_states)  # expects (B, A, D)
+            # normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+            # normalized_actions = normalized_actions.float().cpu().detach().numpy()
+           
+            # --- match training post-processing ---
+            pred_pre = action_head.predict_action(actions_hidden_states)  # torch tensor
+            predicted_actions = torch.tanh(pred_pre)
+
+            normalized_actions = predicted_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
+
         else:
             # Discrete token prediction: convert logits to TEXT-aligned logits too
             logits = language_model_output.logits  # (B, 1+P+(L-1), vocab)
