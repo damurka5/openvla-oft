@@ -8,6 +8,7 @@ import os
 import random
 import time
 import json
+import shutil
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -952,6 +953,16 @@ def set_global_seed(seed: int, deterministic: bool = True) -> None:
 
     print(f"[Seed] Global seed set to {seed} (deterministic={deterministic})", flush=True)
 
+def prepare_tensorboard_log_dir(run_dir: Path, resume: bool) -> Path:
+    """
+    Keep TensorBoard logs isolated from checkpoints and avoid stale events.
+    """
+    tb_log_dir = run_dir / "tensorboard"
+    if tb_log_dir.exists() and not resume:
+        shutil.rmtree(tb_log_dir)
+    tb_log_dir.mkdir(parents=True, exist_ok=True)
+    return tb_log_dir
+
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
     """
@@ -1251,10 +1262,17 @@ def finetune(cfg: FinetuneConfig) -> None:
     if distributed_state.is_main_process:
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
 
+    tb_logdir = run_dir / "tensorboard"
+    if distributed_state.is_main_process:
+        tb_logdir = prepare_tensorboard_log_dir(run_dir, cfg.resume)
+    dist_barrier()
+    tb_logdir.mkdir(parents=True, exist_ok=True)
+    dist_barrier()
+
     if distributed_state.is_main_process:
         print(f"==========================================")
-        print(f"TensorBoard logs directory: {run_dir}")
-        print(f"To view logs: tensorboard --logdir={run_dir}")
+        print(f"TensorBoard logs directory: {tb_logdir}")
+        print(f"To view logs: tensorboard --logdir={tb_logdir}")
         print(f"==========================================")
         
     # Create collator and dataloader
@@ -1290,10 +1308,11 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     tb_writer = None
     if is_rank0():
-        tb_logdir = Path(run_dir)  # log directly into run_dir
-        tb_logdir.mkdir(parents=True, exist_ok=True)
-        tb_writer = SummaryWriter(log_dir=str(tb_logdir), flush_secs=10)
+        purge_step = cfg.resume_step if (cfg.resume and cfg.resume_step is not None) else None
+        tb_writer = SummaryWriter(log_dir=str(tb_logdir), flush_secs=10, purge_step=purge_step)
         print(f"[TensorBoard] Writing events to: {tb_logdir}", flush=True)
+        if purge_step is not None:
+            print(f"[TensorBoard] purge_step={purge_step}", flush=True)
 
     with cfg.stats_path.open("r") as f:
         dataset_stats = json.load(f)
