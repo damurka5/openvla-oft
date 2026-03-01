@@ -5,7 +5,9 @@ Fine-tunes OpenVLA via LoRA.
 """
 
 import os
-import time, json
+import random
+import time
+import json
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,7 @@ from typing import Dict, Optional, Tuple, Type
 from datetime import datetime
 
 import draccus
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
@@ -105,6 +108,8 @@ class FinetuneConfig:
     num_steps_before_decay: int = 100_000            # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
     max_steps: int = 200_000                         # Max number of training steps
+    seed: int = 7                                   # Global random seed (Python/NumPy/Torch/TF)
+    deterministic: bool = True                      # If True, enables deterministic kernels where possible
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
     val_freq: int = 100_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
     val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
@@ -914,11 +919,38 @@ def load_state_dict_skip_action_head(model, state_dict):
     missing, unexpected = model.load_state_dict(filtered, strict=False)
     print(f"[LOAD] missing={len(missing)} unexpected={len(unexpected)} (action_head skipped)", flush=True)
 
-import torch.distributed as dist
-
 def dist_barrier():
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    """
+    Set all relevant RNG seeds used in this training stack.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # TF powers the RLDS pipeline; seed it too for stable shuffle/augment behavior.
+    try:
+        import tensorflow as tf
+
+        tf.random.set_seed(seed)
+        if deterministic and hasattr(tf.config.experimental, "enable_op_determinism"):
+            tf.config.experimental.enable_op_determinism()
+    except Exception as e:
+        print(f"[Seed] TensorFlow seeding skipped: {e}", flush=True)
+
+    if deterministic:
+        # Needs to be set before CUDA kernels are launched.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+    print(f"[Seed] Global seed set to {seed} (deterministic={deterministic})", flush=True)
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -966,6 +998,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     # GPU setup
     distributed_state = PartialState()
     device_id = distributed_state.local_process_index
+
+    # Seed before model/dataset creation so init + data order are reproducible across reruns.
+    set_global_seed(cfg.seed, deterministic=cfg.deterministic)
+
     torch.cuda.set_device(device_id)
     print(
         f"[rank={distributed_state.process_index} local_rank={distributed_state.local_process_index}] "
@@ -1197,6 +1233,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        seed=cfg.seed,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1207,6 +1244,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
+            seed=cfg.seed + 1,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference

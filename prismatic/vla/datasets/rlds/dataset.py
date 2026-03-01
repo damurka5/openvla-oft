@@ -75,9 +75,9 @@ class _DLAdapter:
         return _DLAdapter(ds)
 
     @staticmethod
-    def sample_from_datasets(datasets, weights):
+    def sample_from_datasets(datasets, weights, seed=None):
         tf_dsets = [d._ds if isinstance(d, _DLAdapter) else d for d in datasets]
-        ds = tf.data.Dataset.sample_from_datasets(tf_dsets, weights)
+        ds = tf.data.Dataset.sample_from_datasets(tf_dsets, weights, seed=seed)
         return _DLAdapter(ds)
 
     # ---- trajectory vs frame transforms just map() under the hood ----
@@ -90,8 +90,13 @@ class _DLAdapter:
         return _DLAdapter(ds)
 
     # ---- basic dataset ops used by the pipeline ----
-    def shuffle(self, buffer_size):
-        return _DLAdapter(self._ds.shuffle(buffer_size))
+    def shuffle(self, buffer_size, seed=None, reshuffle_each_iteration=None):
+        kwargs = {}
+        if seed is not None:
+            kwargs["seed"] = seed
+        if reshuffle_each_iteration is not None:
+            kwargs["reshuffle_each_iteration"] = reshuffle_each_iteration
+        return _DLAdapter(self._ds.shuffle(buffer_size, **kwargs))
 
     def cache(self):
         return _DLAdapter(self._ds.cache())
@@ -785,6 +790,7 @@ def make_interleaved_dataset(
     *,
     train: bool,
     shuffle_buffer_size: int,
+    seed: Optional[int] = None,
     traj_transform_kwargs: Optional[Dict] = None,
     frame_transform_kwargs: Optional[Dict] = None,
     batch_size: Optional[int] = None,
@@ -1012,7 +1018,13 @@ def make_interleaved_dataset(
 
     # Interleave at the Frame Level
     DLataset = _get_dlatset_cls()
-    dataset = DLataset.sample_from_datasets(datasets, sample_weights)
+    if seed is not None:
+        try:
+            dataset = DLataset.sample_from_datasets(datasets, sample_weights, seed=seed)
+        except TypeError:
+            dataset = DLataset.sample_from_datasets(datasets, sample_weights)
+    else:
+        dataset = DLataset.sample_from_datasets(datasets, sample_weights)
     dataset = _ensure_dldataset(dataset) 
     # dataset = debug_shape_transforms(dataset)
     # if train:
@@ -1026,7 +1038,13 @@ def make_interleaved_dataset(
             dataset = dataset.cycle()
     # Shuffle the Dataset
     #   =>> IMPORTANT :: Shuffle AFTER .cache(), or else memory will still leak!
-    dataset = dataset.shuffle(shuffle_buffer_size)
+    if seed is not None:
+        try:
+            dataset = dataset.shuffle(shuffle_buffer_size, seed=seed, reshuffle_each_iteration=train)
+        except TypeError:
+            dataset = dataset.shuffle(shuffle_buffer_size)
+    else:
+        dataset = dataset.shuffle(shuffle_buffer_size)
     
     #######
     # Add this test right before the frame transforms to see the actual data:
