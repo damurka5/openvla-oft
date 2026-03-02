@@ -78,6 +78,8 @@ def patched_finetune(cfg: FinetuneConfig) -> None:
     print("=" * 60)
     cfg.resume = False
     cfg.resume_step = None
+    cfg.seed = 7
+    print(f"[Seed] Forcing continuation seed to {cfg.seed}", flush=True)
     
     # Run the original function but patch the LoRA loading
     nvml_handle = None
@@ -105,6 +107,7 @@ def patched_finetune(cfg: FinetuneConfig) -> None:
 
     distributed_state = PartialState()
     device_id = distributed_state.local_process_index
+    set_global_seed(cfg.seed, deterministic=cfg.deterministic)
     torch.cuda.set_device(device_id)
     print(
         f"[rank={distributed_state.process_index} local_rank={distributed_state.local_process_index}] "
@@ -272,6 +275,7 @@ def patched_finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        seed=cfg.seed,
     )
 
     if distributed_state.is_main_process:

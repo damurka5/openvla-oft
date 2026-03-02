@@ -51,6 +51,7 @@ def main() -> int:
         "--wandb_entity=dummy",
         "--wandb_project=dummy",
         "--wandb_log_freq=5",
+        "--seed=7",
     ]
     
     print("[INFO] Running command:")
