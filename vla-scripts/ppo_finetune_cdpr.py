@@ -234,29 +234,48 @@ def _resolve_vision_backbone(vla: nn.Module) -> Any:
     return None
 
 
-def _set_num_images_in_input(vla: nn.Module, num_images: int) -> None:
-    vision_backbone = _resolve_vision_backbone(vla)
-    if vision_backbone is None:
-        raise RuntimeError("Could not locate vision backbone on OpenVLA model wrapper.")
-
+def _set_num_images_in_input(vla: nn.Module, num_images: int) -> int:
     n = int(num_images)
-    if hasattr(vision_backbone, "set_num_images_in_input"):
-        vision_backbone.set_num_images_in_input(n)
-        return
 
-    # Backward-compatibility for older model code that only has the attribute.
-    if hasattr(vision_backbone, "num_images_in_input"):
-        setattr(vision_backbone, "num_images_in_input", n)
+    # Some wrappers expose these directly on the model.
+    if hasattr(vla, "set_num_images_in_input"):
+        vla.set_num_images_in_input(n)
+        return n
+    if hasattr(vla, "num_images_in_input"):
+        setattr(vla, "num_images_in_input", n)
         print(
-            "[WARN] Vision backbone has no set_num_images_in_input(); "
-            "set num_images_in_input directly for compatibility.",
+            "[WARN] Model has no set_num_images_in_input(); set num_images_in_input directly.",
             flush=True,
         )
-        return
+        return n
 
-    raise AttributeError(
-        "Vision backbone does not expose `set_num_images_in_input` or `num_images_in_input`."
-    )
+    vision_backbone = _resolve_vision_backbone(vla)
+    if vision_backbone is not None:
+        if hasattr(vision_backbone, "set_num_images_in_input"):
+            vision_backbone.set_num_images_in_input(n)
+            return n
+        if hasattr(vision_backbone, "num_images_in_input"):
+            setattr(vision_backbone, "num_images_in_input", n)
+            print(
+                "[WARN] Vision backbone has no set_num_images_in_input(); "
+                "set num_images_in_input directly for compatibility.",
+                flush=True,
+            )
+            return n
+
+    # Last-resort fallback for older checkpoints/classes that are fixed to 1 image.
+    if n != 1:
+        print(
+            "[WARN] This OpenVLA build does not expose multi-image controls. "
+            "Falling back to --num_images_in_input=1.",
+            flush=True,
+        )
+    else:
+        print(
+            "[WARN] OpenVLA image-count control API not found; continuing in single-image mode.",
+            flush=True,
+        )
+    return 1
 
 
 def _resolve_cdpr_dataset_root(path_like: str | Path) -> Path:
@@ -346,7 +365,7 @@ def load_vla_and_processor(args: argparse.Namespace, device: torch.device):
         trust_remote_code=True,
     ).to(device)
 
-    _set_num_images_in_input(vla, args.num_images_in_input)
+    args.num_images_in_input = _set_num_images_in_input(vla, args.num_images_in_input)
 
     adapter_loaded = False
     if args.adapter_path:
