@@ -32,6 +32,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from torch.distributions import Normal
 from torch.optim import AdamW
+from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
 from experiments.robot.openvla_utils import check_model_logic_mismatch, model_is_on_hf_hub, update_auto_map
@@ -201,53 +202,70 @@ def save_run_config(args: argparse.Namespace, run_dir: Path) -> None:
         json.dump(vars(args), f, indent=2, sort_keys=True)
 
 
-def register_openvla_autoclasses(vla_path: str) -> None:
+def _resolve_and_prepare_vla_path(vla_path: str) -> str:
+    # Mirror `finetune.py` behavior:
+    # - For HF Hub models, download snapshot and use local path.
+    # - For local models, register OpenVLA auto-classes.
+    # - In both cases, sync config auto_map + local modeling/configuration files.
     if model_is_on_hf_hub(vla_path):
-        return
-    AutoConfig.register("openvla", OpenVLAConfig)
-    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
-    update_auto_map(vla_path)
-    check_model_logic_mismatch(vla_path)
+        resolved_path = snapshot_download(repo_id=vla_path)
+    else:
+        resolved_path = vla_path
+        AutoConfig.register("openvla", OpenVLAConfig)
+        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+    update_auto_map(resolved_path)
+    check_model_logic_mismatch(resolved_path)
+    return resolved_path
+
+
+def _iter_model_candidates(model: Any) -> List[Any]:
+    out: List[Any] = []
+    queue: List[Any] = [model]
+    seen: set[int] = set()
+
+    while queue:
+        cur = queue.pop(0)
+        if cur is None:
+            continue
+        oid = id(cur)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        out.append(cur)
+
+        for attr in ("module", "model", "base_model"):
+            child = getattr(cur, attr, None)
+            if child is not None and id(child) not in seen:
+                queue.append(child)
+
+    return out
 
 
 def _resolve_vision_backbone(vla: nn.Module) -> Any:
-    # Newer wrappers usually expose `vla.vision_backbone`.
-    if hasattr(vla, "vision_backbone"):
-        return vla.vision_backbone
-
-    # Some wrappers keep components under `model`.
-    model = getattr(vla, "model", None)
-    if model is not None and hasattr(model, "vision_backbone"):
-        return model.vision_backbone
-
-    # PEFT / wrapped variants can place the model one level deeper.
-    base = getattr(vla, "base_model", None)
-    if base is not None:
-        if hasattr(base, "vision_backbone"):
-            return base.vision_backbone
-        inner = getattr(base, "model", None)
-        if inner is not None and hasattr(inner, "vision_backbone"):
-            return inner.vision_backbone
-
+    for obj in _iter_model_candidates(vla):
+        vb = getattr(obj, "vision_backbone", None)
+        if vb is not None:
+            return vb
     return None
 
 
 def _set_num_images_in_input(vla: nn.Module, num_images: int) -> int:
     n = int(num_images)
 
-    # Some wrappers expose these directly on the model.
-    if hasattr(vla, "set_num_images_in_input"):
-        vla.set_num_images_in_input(n)
-        return n
-    if hasattr(vla, "num_images_in_input"):
-        setattr(vla, "num_images_in_input", n)
-        print(
-            "[WARN] Model has no set_num_images_in_input(); set num_images_in_input directly.",
-            flush=True,
-        )
-        return n
+    for obj in _iter_model_candidates(vla):
+        if hasattr(obj, "set_num_images_in_input"):
+            obj.set_num_images_in_input(n)
+            return n
+        if hasattr(obj, "num_images_in_input"):
+            setattr(obj, "num_images_in_input", n)
+            print(
+                "[WARN] Model has no set_num_images_in_input(); set num_images_in_input directly.",
+                flush=True,
+            )
+            return n
 
     vision_backbone = _resolve_vision_backbone(vla)
     if vision_backbone is not None:
@@ -259,6 +277,15 @@ def _set_num_images_in_input(vla: nn.Module, num_images: int) -> int:
             print(
                 "[WARN] Vision backbone has no set_num_images_in_input(); "
                 "set num_images_in_input directly for compatibility.",
+                flush=True,
+            )
+            return n
+        # Some older backbones may store image count in config only.
+        vb_cfg = getattr(vision_backbone, "config", None)
+        if vb_cfg is not None and hasattr(vb_cfg, "num_images_in_input"):
+            setattr(vb_cfg, "num_images_in_input", n)
+            print(
+                "[WARN] Set vision_backbone.config.num_images_in_input directly for compatibility.",
                 flush=True,
             )
             return n
@@ -276,6 +303,31 @@ def _set_num_images_in_input(vla: nn.Module, num_images: int) -> int:
             flush=True,
         )
     return 1
+
+
+def _resolve_llm_dim(vla: nn.Module) -> Optional[int]:
+    for obj in _iter_model_candidates(vla):
+        llm_dim = getattr(obj, "llm_dim", None)
+        if llm_dim is not None:
+            return int(llm_dim)
+
+        cfg = getattr(obj, "config", None)
+        if cfg is not None:
+            text_cfg = getattr(cfg, "text_config", None)
+            hidden = getattr(text_cfg, "hidden_size", None) if text_cfg is not None else None
+            if hidden is not None:
+                return int(hidden)
+            hidden = getattr(cfg, "hidden_size", None)
+            if hidden is not None:
+                return int(hidden)
+
+        lm = getattr(obj, "language_model", None)
+        lm_cfg = getattr(lm, "config", None) if lm is not None else None
+        hidden = getattr(lm_cfg, "hidden_size", None) if lm_cfg is not None else None
+        if hidden is not None:
+            return int(hidden)
+
+    return None
 
 
 def _resolve_cdpr_dataset_root(path_like: str | Path) -> Path:
@@ -354,12 +406,13 @@ def _extract_state_dict(maybe_state: Any) -> Dict[str, torch.Tensor]:
 
 
 def load_vla_and_processor(args: argparse.Namespace, device: torch.device):
-    register_openvla_autoclasses(args.vla_path)
+    resolved_vla_path = _resolve_and_prepare_vla_path(args.vla_path)
+    print(f"[model] Loading VLA from: {resolved_vla_path}", flush=True)
 
-    processor = AutoProcessor.from_pretrained(args.vla_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(resolved_vla_path, trust_remote_code=True)
     torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     vla = AutoModelForVision2Seq.from_pretrained(
-        args.vla_path,
+        resolved_vla_path,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
@@ -771,11 +824,7 @@ def main() -> None:
 
     vla, processor = load_vla_and_processor(args, device)
 
-    llm_dim = getattr(vla, "llm_dim", None)
-    if llm_dim is None:
-        base = getattr(vla, "base_model", None)
-        if base is not None and hasattr(base, "model"):
-            llm_dim = getattr(base.model, "llm_dim", None)
+    llm_dim = _resolve_llm_dim(vla)
     if llm_dim is None:
         raise RuntimeError("Could not resolve llm_dim from OpenVLA model wrapper.")
 
