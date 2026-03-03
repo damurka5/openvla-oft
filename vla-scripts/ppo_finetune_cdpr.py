@@ -212,6 +212,53 @@ def register_openvla_autoclasses(vla_path: str) -> None:
     check_model_logic_mismatch(vla_path)
 
 
+def _resolve_vision_backbone(vla: nn.Module) -> Any:
+    # Newer wrappers usually expose `vla.vision_backbone`.
+    if hasattr(vla, "vision_backbone"):
+        return vla.vision_backbone
+
+    # Some wrappers keep components under `model`.
+    model = getattr(vla, "model", None)
+    if model is not None and hasattr(model, "vision_backbone"):
+        return model.vision_backbone
+
+    # PEFT / wrapped variants can place the model one level deeper.
+    base = getattr(vla, "base_model", None)
+    if base is not None:
+        if hasattr(base, "vision_backbone"):
+            return base.vision_backbone
+        inner = getattr(base, "model", None)
+        if inner is not None and hasattr(inner, "vision_backbone"):
+            return inner.vision_backbone
+
+    return None
+
+
+def _set_num_images_in_input(vla: nn.Module, num_images: int) -> None:
+    vision_backbone = _resolve_vision_backbone(vla)
+    if vision_backbone is None:
+        raise RuntimeError("Could not locate vision backbone on OpenVLA model wrapper.")
+
+    n = int(num_images)
+    if hasattr(vision_backbone, "set_num_images_in_input"):
+        vision_backbone.set_num_images_in_input(n)
+        return
+
+    # Backward-compatibility for older model code that only has the attribute.
+    if hasattr(vision_backbone, "num_images_in_input"):
+        setattr(vision_backbone, "num_images_in_input", n)
+        print(
+            "[WARN] Vision backbone has no set_num_images_in_input(); "
+            "set num_images_in_input directly for compatibility.",
+            flush=True,
+        )
+        return
+
+    raise AttributeError(
+        "Vision backbone does not expose `set_num_images_in_input` or `num_images_in_input`."
+    )
+
+
 def _resolve_cdpr_dataset_root(path_like: str | Path) -> Path:
     raw = Path(path_like).expanduser()
     if not raw.is_absolute():
@@ -299,7 +346,7 @@ def load_vla_and_processor(args: argparse.Namespace, device: torch.device):
         trust_remote_code=True,
     ).to(device)
 
-    vla.vision_backbone.set_num_images_in_input(args.num_images_in_input)
+    _set_num_images_in_input(vla, args.num_images_in_input)
 
     adapter_loaded = False
     if args.adapter_path:
