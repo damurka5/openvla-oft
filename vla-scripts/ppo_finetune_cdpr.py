@@ -99,6 +99,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--cdpr_mujoco_root",
+        type=str,
+        default=os.environ.get("CDPR_MUJOCO_ROOT", None),
+        help=(
+            "Optional path to parent directory that contains `cdpr_mujoco/` "
+            "(e.g. `/root/repo/VLA_CDPR`). Auto-detected if omitted."
+        ),
+    )
+    ap.add_argument(
         "--catalog_path",
         type=str,
         default=None,
@@ -355,6 +364,38 @@ def _resolve_cdpr_dataset_root(path_like: str | Path) -> Path:
         "Could not locate CDPR-Dataset root. Expected a directory containing `cdpr_dataset/`. "
         f"Checked: {attempted}"
     )
+
+
+def _resolve_cdpr_mujoco_parent(
+    cdpr_root: Path,
+    explicit_root: str | Path | None,
+) -> Path | None:
+    candidates: List[Path] = []
+
+    if explicit_root:
+        p = Path(explicit_root).expanduser().resolve()
+        candidates.append(p)
+        if p.name == "cdpr_mujoco":
+            candidates.append(p.parent)
+
+    candidates.extend(
+        [
+            cdpr_root.parent / "VLA_CDPR",
+            cdpr_root.parent,
+            Path("/root/repo/VLA_CDPR"),
+            Path("/root/repo"),
+        ]
+    )
+
+    seen: set[Path] = set()
+    for base in candidates:
+        b = base.resolve()
+        if b in seen:
+            continue
+        seen.add(b)
+        if (b / "cdpr_mujoco").is_dir():
+            return b
+    return None
 
 
 def _resolve_adapter_dir(path_like: str | Path) -> Path:
@@ -701,6 +742,7 @@ class CDPRVisionLanguageEnv:
     def __init__(
         self,
         cdpr_dataset_root: Path,
+        cdpr_mujoco_root: Optional[str],
         catalog_path: Optional[str],
         max_steps: int,
         capture_frames: bool,
@@ -716,6 +758,16 @@ class CDPRVisionLanguageEnv:
         cdpr_root = _resolve_cdpr_dataset_root(cdpr_dataset_root)
         if str(cdpr_root) not in sys.path:
             sys.path.insert(0, str(cdpr_root))
+        cdpr_mj_parent = _resolve_cdpr_mujoco_parent(cdpr_root, cdpr_mujoco_root)
+        if cdpr_mj_parent is not None and str(cdpr_mj_parent) not in sys.path:
+            sys.path.insert(0, str(cdpr_mj_parent))
+            print(f"[env] Added cdpr_mujoco parent to PYTHONPATH: {cdpr_mj_parent}", flush=True)
+        elif cdpr_mj_parent is None:
+            print(
+                "[WARN] Could not auto-locate `cdpr_mujoco/` package parent. "
+                "If env creation fails, pass --cdpr_mujoco_root /path/to/parent.",
+                flush=True,
+            )
 
         from cdpr_dataset.rl_cdpr_env import CDPRLanguageRLEnv
 
@@ -865,6 +917,7 @@ def main() -> None:
 
     env = CDPRVisionLanguageEnv(
         cdpr_dataset_root=Path(args.cdpr_dataset_root),
+        cdpr_mujoco_root=args.cdpr_mujoco_root,
         catalog_path=args.catalog_path,
         max_steps=args.max_env_steps,
         capture_frames=args.capture_frames,
