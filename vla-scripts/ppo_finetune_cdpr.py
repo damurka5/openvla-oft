@@ -398,6 +398,16 @@ def _resolve_cdpr_mujoco_parent(
     return None
 
 
+def _prepend_to_pythonpath(path: Path) -> None:
+    p = str(path.resolve())
+    current = os.environ.get("PYTHONPATH", "")
+    parts = [x for x in current.split(os.pathsep) if x]
+    if p in parts:
+        return
+    new_parts = [p] + parts
+    os.environ["PYTHONPATH"] = os.pathsep.join(new_parts)
+
+
 def _resolve_adapter_dir(path_like: str | Path) -> Path:
     base = Path(path_like).expanduser().resolve()
     candidates = [base, base / "vla_cdpr_adapter"]
@@ -762,6 +772,9 @@ class CDPRVisionLanguageEnv:
         if cdpr_mj_parent is not None and str(cdpr_mj_parent) not in sys.path:
             sys.path.insert(0, str(cdpr_mj_parent))
             print(f"[env] Added cdpr_mujoco parent to PYTHONPATH: {cdpr_mj_parent}", flush=True)
+        if cdpr_mj_parent is not None:
+            _prepend_to_pythonpath(cdpr_mj_parent)
+            print(f"[env] Exported PYTHONPATH for subprocesses: {cdpr_mj_parent}", flush=True)
         elif cdpr_mj_parent is None:
             print(
                 "[WARN] Could not auto-locate `cdpr_mujoco/` package parent. "
