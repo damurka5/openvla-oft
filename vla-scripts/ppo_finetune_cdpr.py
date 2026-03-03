@@ -114,6 +114,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional cdpr_scene_catalog.yaml path. If omitted, CDPR env default is used.",
     )
     ap.add_argument("--max_env_steps", type=int, default=150)
+    ap.add_argument(
+        "--action_step_xyz",
+        type=float,
+        default=0.01,
+        help="World-frame XYZ delta scale per action step (teleop uses 0.01).",
+    )
+    ap.add_argument(
+        "--action_step_yaw",
+        type=float,
+        default=0.25,
+        help="Yaw delta scale per action step.",
+    )
     ap.add_argument("--capture_frames", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument(
         "--desk_textures_dir",
@@ -157,6 +169,18 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Optional subset: pick_up move_left move_right move_top move_bottom",
+    )
+    ap.add_argument(
+        "--invert_x_action",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Invert applied X action before sending command to env (for coordinate debugging).",
+    )
+    ap.add_argument(
+        "--invert_y_action",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Invert applied Y action before sending command to env (for coordinate debugging).",
     )
 
     # PPO
@@ -406,6 +430,48 @@ def _prepend_to_pythonpath(path: Path) -> None:
         return
     new_parts = [p] + parts
     os.environ["PYTHONPATH"] = os.pathsep.join(new_parts)
+
+
+def _apply_cdpr_env_runtime_shims(CDPRLanguageRLEnv: Any, rl_env_module: Any) -> None:
+    """
+    Runtime compatibility layer for CDPR env variants across MuJoCo Python bindings.
+
+    Some builds expose `data.body_xpos`; others expose `data.xpos` or named accessors.
+    """
+    if getattr(CDPRLanguageRLEnv, "_openvla_compat_patched", False):
+        return
+
+    mj_mod = getattr(rl_env_module, "mj", None)
+    orig_get_body_position = CDPRLanguageRLEnv._get_body_position
+
+    def _get_body_position_compat(self, body_name: str) -> np.ndarray:
+        try:
+            return orig_get_body_position(self, body_name)
+        except AttributeError as exc:
+            if "body_xpos" not in str(exc):
+                raise
+            if mj_mod is None:
+                raise
+
+            bid = mj_mod.mj_name2id(self.sim.model, mj_mod.mjtObj.mjOBJ_BODY, body_name)
+            if bid == -1:
+                raise RuntimeError(f"Body '{body_name}' not found in MuJoCo model.")
+
+            data = self.sim.data
+            if hasattr(data, "xpos"):
+                return np.asarray(data.xpos[bid], dtype=np.float32).copy()
+
+            if hasattr(data, "body"):
+                try:
+                    return np.asarray(data.body(body_name).xpos, dtype=np.float32).copy()
+                except Exception:
+                    pass
+
+            raise
+
+    CDPRLanguageRLEnv._get_body_position = _get_body_position_compat
+    CDPRLanguageRLEnv._openvla_compat_patched = True
+    print("[env] Applied runtime compatibility shim for MuJoCo body position access.", flush=True)
 
 
 def _resolve_adapter_dir(path_like: str | Path) -> Path:
@@ -755,6 +821,8 @@ class CDPRVisionLanguageEnv:
         cdpr_mujoco_root: Optional[str],
         catalog_path: Optional[str],
         max_steps: int,
+        action_step_xyz: float,
+        action_step_yaw: float,
         capture_frames: bool,
         instruction_types: Optional[Sequence[str]],
         desk_textures_dir: str,
@@ -763,6 +831,8 @@ class CDPRVisionLanguageEnv:
         desk_texrepeat: Sequence[int],
         wrapper_cleanup: bool,
         use_wrapper_cache: bool,
+        invert_x_action: bool,
+        invert_y_action: bool,
         seed: int,
     ):
         cdpr_root = _resolve_cdpr_dataset_root(cdpr_dataset_root)
@@ -782,11 +852,15 @@ class CDPRVisionLanguageEnv:
                 flush=True,
             )
 
-        from cdpr_dataset.rl_cdpr_env import CDPRLanguageRLEnv
+        import cdpr_dataset.rl_cdpr_env as rl_env_module
+        CDPRLanguageRLEnv = rl_env_module.CDPRLanguageRLEnv
+        _apply_cdpr_env_runtime_shims(CDPRLanguageRLEnv, rl_env_module)
 
         self.env = CDPRLanguageRLEnv(
             catalog_path=catalog_path,
             max_steps=max_steps,
+            action_step_xyz=action_step_xyz,
+            action_step_yaw=action_step_yaw,
             capture_frames=capture_frames,
             instruction_types=instruction_types,
             desk_textures_dir=desk_textures_dir,
@@ -798,6 +872,8 @@ class CDPRVisionLanguageEnv:
             seed=seed,
         )
         self._instruction = ""
+        self.invert_x_action = bool(invert_x_action)
+        self.invert_y_action = bool(invert_y_action)
 
     def reset(self) -> Dict[str, Any]:
         _, info = self.env.reset()
@@ -817,7 +893,12 @@ class CDPRVisionLanguageEnv:
         return obs
 
     def step(self, action: np.ndarray):
-        _, reward, terminated, truncated, info = self.env.step(action)
+        action_env = np.asarray(action, dtype=np.float32).copy()
+        if self.invert_x_action:
+            action_env[0] *= -1.0
+        if self.invert_y_action:
+            action_env[1] *= -1.0
+        _, reward, terminated, truncated, info = self.env.step(action_env)
         self._instruction = str(info.get("language_instruction", self._instruction))
 
         obs = {
@@ -933,6 +1014,8 @@ def main() -> None:
         cdpr_mujoco_root=args.cdpr_mujoco_root,
         catalog_path=args.catalog_path,
         max_steps=args.max_env_steps,
+        action_step_xyz=args.action_step_xyz,
+        action_step_yaw=args.action_step_yaw,
         capture_frames=args.capture_frames,
         instruction_types=args.instruction_types,
         desk_textures_dir=args.desk_textures_dir,
@@ -941,6 +1024,8 @@ def main() -> None:
         desk_texrepeat=args.desk_texrepeat,
         wrapper_cleanup=args.wrapper_cleanup,
         use_wrapper_cache=args.use_wrapper_cache,
+        invert_x_action=args.invert_x_action,
+        invert_y_action=args.invert_y_action,
         seed=args.seed,
     )
 
