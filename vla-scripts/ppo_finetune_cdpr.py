@@ -126,8 +126,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--action_step_xyz",
         type=float,
-        default=0.01,
-        help="World-frame XYZ delta scale per action step (teleop uses 0.01).",
+        default=0.005,
+        help="World-frame XYZ delta scale per action step (teleop commonly uses 0.005-0.01).",
     )
     ap.add_argument(
         "--action_step_yaw",
@@ -145,7 +145,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--allowed_objects",
         nargs="*",
-        default=["ycb_apple", "ycb_pear", "ycb_peach"],
+        default=["bowl", "plate", "ycb_bowl", "ycb_apple", "ycb_peach", "ycb_pear"],
         help="Restrict target objects to this list.",
     )
     ap.add_argument(
@@ -183,7 +183,7 @@ def parse_args() -> argparse.Namespace:
         "--scene_sampling",
         type=str,
         choices=["env_random", "round_robin", "random"],
-        default="round_robin",
+        default="env_random",
         help=(
             "How to pick scene on reset. "
             "`env_random` lets CDPR env sample; `round_robin` cycles catalog scenes; "
@@ -193,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--scene_refresh_every_steps",
         type=int,
-        default=1,
+        default=-1,
         help=(
             "Force reset every N interaction steps to resample scene/object positions/instruction. "
             "Use <=0 to disable forced refresh and reset only on env termination."
@@ -242,6 +242,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Extra reward coefficient for positive reduction in EE-to-target distance "
             "(delta action moves closer to target)."
+        ),
+    )
+    ap.add_argument(
+        "--delta_farther_penalty_coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional penalty coefficient for negative reduction in EE-to-target distance "
+            "(delta action moves farther from target)."
         ),
     )
 
@@ -1212,13 +1221,15 @@ def _shape_reward_with_delta_progress(
     distance_before: Optional[float],
     distance_after: Optional[float],
     delta_closer_reward_coef: float,
-) -> Tuple[float, float, float]:
+    delta_farther_penalty_coef: float,
+) -> Tuple[float, float, float, float]:
     if distance_before is None or distance_after is None:
-        return float(env_reward), 0.0, 0.0
+        return float(env_reward), 0.0, 0.0, 0.0
     raw_delta = float(distance_before - distance_after)
     closer_bonus = float(max(raw_delta, 0.0) * max(float(delta_closer_reward_coef), 0.0))
-    shaped_reward = float(env_reward + closer_bonus)
-    return shaped_reward, closer_bonus, raw_delta
+    farther_penalty = float(max(-raw_delta, 0.0) * max(float(delta_farther_penalty_coef), 0.0))
+    shaped_reward = float(env_reward + closer_bonus - farther_penalty)
+    return shaped_reward, closer_bonus, farther_penalty, raw_delta
 
 
 def _make_scene_reset_sampler(
@@ -1272,6 +1283,7 @@ def run_validation_rollouts(
     max_steps: int,
     num_images_in_input: int,
     delta_closer_reward_coef: float,
+    delta_farther_penalty_coef: float,
     save_frames: bool,
     quiet_env_logs: bool,
     next_reset_options,
@@ -1315,11 +1327,12 @@ def run_validation_rollouts(
                 next_obs, env_reward, done, info = val_env.step(action_np)
             dist_after = _distance_ee_to_target_from_obs(next_obs)
 
-            shaped_reward, closer_bonus, raw_delta = _shape_reward_with_delta_progress(
+            shaped_reward, closer_bonus, farther_penalty, raw_delta = _shape_reward_with_delta_progress(
                 env_reward=env_reward,
                 distance_before=dist_before,
                 distance_after=dist_after,
                 delta_closer_reward_coef=delta_closer_reward_coef,
+                delta_farther_penalty_coef=delta_farther_penalty_coef,
             )
 
             env_return += float(env_reward)
@@ -1339,6 +1352,7 @@ def run_validation_rollouts(
                     "reward_env": float(env_reward),
                     "reward_shaped": float(shaped_reward),
                     "closer_bonus": float(closer_bonus),
+                    "farther_penalty": float(farther_penalty),
                     "distance_delta_raw": float(raw_delta),
                     "distance_before": _float_or_none(dist_before),
                     "distance_after": _float_or_none(dist_after),
@@ -1606,7 +1620,8 @@ def main() -> None:
                 f"[env] scene_sampling={args.scene_sampling} "
                 f"scene_refresh_every_steps={args.scene_refresh_every_steps} "
                 f"catalog_scenes={len(scene_names)} "
-                f"delta_closer_reward_coef={args.delta_closer_reward_coef}",
+                f"delta_closer_reward_coef={args.delta_closer_reward_coef} "
+                f"delta_farther_penalty_coef={args.delta_farther_penalty_coef}",
                 flush=True,
             )
             if len(scene_names) < 2:
@@ -1683,11 +1698,12 @@ def main() -> None:
                 dist_before = _distance_ee_to_target_from_obs(obs)
                 next_obs, env_reward, env_done, step_info = env.step(action_np)
                 dist_after = _distance_ee_to_target_from_obs(next_obs)
-                reward, closer_bonus, raw_dist_delta = _shape_reward_with_delta_progress(
+                reward, closer_bonus, farther_penalty, raw_dist_delta = _shape_reward_with_delta_progress(
                     env_reward=env_reward,
                     distance_before=dist_before,
                     distance_after=dist_after,
                     delta_closer_reward_coef=args.delta_closer_reward_coef,
+                    delta_farther_penalty_coef=args.delta_farther_penalty_coef,
                 )
                 global_step += 1
                 forced_scene_refresh = (
@@ -1737,6 +1753,7 @@ def main() -> None:
                             "reward_env": float(env_reward),
                             "reward_shaped": float(reward),
                             "closer_bonus": float(closer_bonus),
+                            "farther_penalty": float(farther_penalty),
                             "distance_delta_raw": float(raw_dist_delta),
                             "distance_before": _float_or_none(dist_before),
                             "distance_after": _float_or_none(dist_after),
@@ -1902,6 +1919,7 @@ def main() -> None:
                     max_steps=args.validation_max_steps,
                     num_images_in_input=args.num_images_in_input,
                     delta_closer_reward_coef=args.delta_closer_reward_coef,
+                    delta_farther_penalty_coef=args.delta_farther_penalty_coef,
                     save_frames=bool(args.save_validation_frames),
                     quiet_env_logs=bool(args.quiet_env_logs),
                     next_reset_options=next_val_reset_options,
