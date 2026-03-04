@@ -190,6 +190,12 @@ def parse_args() -> argparse.Namespace:
     # PPO
     ap.add_argument("--total_updates", type=int, default=3000)
     ap.add_argument("--rollout_steps", type=int, default=256)
+    ap.add_argument(
+        "--rollout_log_every",
+        type=int,
+        default=16,
+        help="Print rollout collection heartbeat every N env steps (0 disables).",
+    )
     ap.add_argument("--ppo_epochs", type=int, default=4)
     ap.add_argument("--minibatch_size", type=int, default=4)
     ap.add_argument(
@@ -236,6 +242,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument("--save_every", type=int, default=100)
+    ap.add_argument(
+        "--train_log_every",
+        type=int,
+        default=20,
+        help="Print PPO optimization heartbeat every N minibatches (0 disables).",
+    )
     ap.add_argument("--run_root_dir", type=str, default="runs_ppo")
     ap.add_argument("--run_id", type=str, default=None)
     ap.add_argument("--num_images_in_input", type=int, default=2, choices=[1, 2])
@@ -1258,8 +1270,15 @@ def main() -> None:
             transitions: List[Transition] = []
             episode_returns = []
             ep_ret = 0.0
+            update_t0 = time.time()
+            rollout_t0 = time.time()
+            if is_main:
+                print(
+                    f"[update {update:05d}] collecting rollout ({args.rollout_steps} steps)...",
+                    flush=True,
+                )
 
-            for _ in range(args.rollout_steps):
+            for rollout_i in range(args.rollout_steps):
                 with torch.no_grad():
                     mean_action, std_action, value = policy(
                         images_primary=[obs["image_primary"]],
@@ -1295,6 +1314,18 @@ def main() -> None:
                     ep_ret = 0.0
                     obs = env.reset()
 
+                if is_main and args.rollout_log_every > 0:
+                    done_rollout = (rollout_i + 1) >= args.rollout_steps
+                    if ((rollout_i + 1) % args.rollout_log_every == 0) or done_rollout:
+                        elapsed = time.time() - rollout_t0
+                        sps = (rollout_i + 1) / max(elapsed, 1e-6)
+                        print(
+                            f"[update {update:05d}][rollout] "
+                            f"{rollout_i + 1}/{args.rollout_steps} steps "
+                            f"({sps:.2f} env_steps/s)",
+                            flush=True,
+                        )
+
             with torch.no_grad():
                 _, _, next_value_t = policy(
                     images_primary=[obs["image_primary"]],
@@ -1321,6 +1352,14 @@ def main() -> None:
 
             policy.train()
             idxs = np.arange(len(transitions))
+            total_minibatches = args.ppo_epochs * max(1, math.ceil(len(idxs) / args.minibatch_size))
+            mb_done = 0
+            train_t0 = time.time()
+            if is_main:
+                print(
+                    f"[update {update:05d}] optimizing PPO ({total_minibatches} minibatches)...",
+                    flush=True,
+                )
             for _ in range(args.ppo_epochs):
                 np.random.shuffle(idxs)
                 for start in range(0, len(idxs), args.minibatch_size):
@@ -1330,6 +1369,10 @@ def main() -> None:
 
                     optimizer.zero_grad(set_to_none=True)
                     micro_splits = max(1, math.ceil(len(mb_idx) / args.microbatch_size))
+                    mb_loss_acc = 0.0
+                    mb_policy_loss_acc = 0.0
+                    mb_value_loss_acc = 0.0
+                    mb_entropy_acc = 0.0
 
                     for micro_start in range(0, len(mb_idx), args.microbatch_size):
                         micro_idx = mb_idx[micro_start : micro_start + args.microbatch_size]
@@ -1379,10 +1422,29 @@ def main() -> None:
                             value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
                             loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
+                            mb_loss_acc += float(loss.item())
+                            mb_policy_loss_acc += float(policy_loss.item())
+                            mb_value_loss_acc += float(value_loss.item())
+                            mb_entropy_acc += float(entropy.item())
                             (loss / micro_splits).backward()
 
                     nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
                     optimizer.step()
+                    mb_done += 1
+
+                    if is_main and args.train_log_every > 0:
+                        done_train = mb_done >= total_minibatches
+                        if (mb_done % args.train_log_every == 0) or done_train:
+                            print(
+                                f"[update {update:05d}][train] "
+                                f"{mb_done}/{total_minibatches} minibatches "
+                                f"loss={mb_loss_acc / micro_splits:.4f} "
+                                f"policy={mb_policy_loss_acc / micro_splits:.4f} "
+                                f"value={mb_value_loss_acc / micro_splits:.4f} "
+                                f"entropy={mb_entropy_acc / micro_splits:.4f} "
+                                f"elapsed={time.time() - train_t0:.1f}s",
+                                flush=True,
+                            )
 
             avg_rollout_reward = float(rewards.mean())
             avg_return = float(np.mean(episode_returns)) if episode_returns else ep_ret
@@ -1393,7 +1455,8 @@ def main() -> None:
                     f"global_step={global_step} "
                     f"rollout_reward_mean={avg_rollout_reward:.4f} "
                     f"episode_return_mean={avg_return:.4f} "
-                    f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
+                    f"log_std_mean={float(policy_core.log_std.mean().item()):.4f} "
+                    f"update_time={time.time() - update_t0:.1f}s",
                     flush=True,
                 )
 
