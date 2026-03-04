@@ -19,10 +19,13 @@ import argparse
 import math
 import os
 import random
+import re
+import shutil
 import sys
 import time
 import json
 import inspect
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -200,6 +203,27 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--prebuild_scene_cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Prebuild a fixed cache of scene wrappers/textured variants once at startup and reuse them on reset "
+            "(prevents per-reset wrapper/texture file growth)."
+        ),
+    )
+    ap.add_argument(
+        "--scene_pool_size",
+        type=int,
+        default=5,
+        help="How many catalog scenes to keep in the reusable scene pool. Use <=0 for all scenes.",
+    )
+    ap.add_argument(
+        "--texture_pool_size",
+        type=int,
+        default=10,
+        help="How many desk textures to prebuild per scene in scene-cache mode. Use <=0 for all.",
+    )
+    ap.add_argument(
         "--invert_x_action",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -300,8 +324,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--validate_every_updates",
         type=int,
-        default=10,
-        help="Run deterministic validation rollouts every N PPO updates (rank 0). Use <=0 to disable.",
+        default=-1,
+        help="Run deterministic validation rollouts in a separate env every N PPO updates (rank 0). Use <=0 to disable.",
     )
     ap.add_argument(
         "--validation_episodes",
@@ -318,8 +342,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--save_validation_frames",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Save overview/wrist PNG frames during periodic validation rollouts.",
+    )
+    ap.add_argument(
+        "--rollout_tap_every_updates",
+        type=int,
+        default=10,
+        help=(
+            "Dump training-rollout diagnostics to .npz every N updates using already-computed policy calls "
+            "(no extra env resets/renders). Use <=0 to disable."
+        ),
     )
     ap.add_argument("--run_root_dir", type=str, default="runs_ppo")
     ap.add_argument("--run_id", type=str, default=None)
@@ -402,6 +435,144 @@ def save_run_config(args: argparse.Namespace, run_dir: Path) -> None:
     out = run_dir / "run_config.json"
     with out.open("w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, sort_keys=True)
+
+
+def _strip_generated_texture_prefix(name: str) -> str:
+    # Generated texture names in CDPR wrappers commonly look like:
+    # rl_<stamp>__rl_<stamp>__...__<base_name>.png
+    out = str(name)
+    for _ in range(32):
+        new_out = re.sub(r"^rl_[^_]+__", "", out)
+        if new_out == out:
+            break
+        out = new_out
+    return out
+
+
+def _prepare_desk_textures_dir(src_dir: str, run_dir: Path, is_main: bool, rank: int) -> str:
+    src = Path(src_dir).expanduser().resolve()
+    if not src.exists() or not src.is_dir():
+        return str(src)
+
+    texture_files = sorted(p for p in src.iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
+    if not texture_files:
+        return str(src)
+
+    base_candidates = [p for p in texture_files if (not p.name.startswith("rl_")) and ("__rl_" not in p.name)]
+    if len(base_candidates) == 0:
+        # Fallback: collapse generated chains by canonical tail name and pick shortest source name.
+        dedup: Dict[str, Path] = {}
+        for p in texture_files:
+            canonical_name = _strip_generated_texture_prefix(p.name)
+            cur = dedup.get(canonical_name)
+            if cur is None or len(p.name) < len(cur.name):
+                dedup[canonical_name] = p
+        base_candidates = sorted(dedup.values(), key=lambda x: x.name)
+
+    # If we already look clean, keep original path.
+    if len(base_candidates) == len(texture_files) and all(p in texture_files for p in base_candidates):
+        return str(src)
+
+    cleaned_dir = run_dir / "desk_textures_clean"
+    cleaned_dir.mkdir(parents=True, exist_ok=True)
+
+    kept = 0
+    for p in base_candidates:
+        canonical_name = _strip_generated_texture_prefix(p.name)
+        dst = cleaned_dir / canonical_name
+        if dst.exists():
+            continue
+        try:
+            os.symlink(str(p), str(dst))
+        except Exception:
+            shutil.copy2(str(p), str(dst))
+        kept += 1
+
+    if is_main:
+        print(
+            f"[env] Sanitized desk textures dir: {src} -> {cleaned_dir} "
+            f"(kept {kept}/{len(texture_files)} files; dropped generated variants).",
+            flush=True,
+        )
+        if "_desk_textures" in str(src):
+            print(
+                "[WARN] desk_textures_dir points to wrappers cache. Prefer original source textures dir to avoid "
+                "recursive rl_* texture names and disk growth.",
+                flush=True,
+            )
+
+    out_path = str(cleaned_dir)
+    return _broadcast_object(out_path if rank == 0 else None, rank)
+
+
+def _read_scene_names_from_catalog(catalog_path: Optional[str]) -> List[str]:
+    if catalog_path is None:
+        return []
+    path = Path(catalog_path).expanduser().resolve()
+    if not path.exists():
+        return []
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return []
+    scenes_raw = cfg.get("scenes", []) if isinstance(cfg, dict) else []
+    out: List[str] = []
+    for row in scenes_raw:
+        if isinstance(row, dict):
+            name = row.get("name")
+            if name:
+                out.append(str(name))
+        elif row:
+            out.append(str(row))
+    return out
+
+
+def _prune_generated_wrapper_artifacts(
+    cdpr_dataset_root: Path,
+    is_main: bool,
+    rank: int,
+) -> None:
+    wrappers_dir = cdpr_dataset_root.expanduser().resolve() / "cdpr_dataset" / "wrappers"
+    if not wrappers_dir.exists():
+        return
+
+    removed = 0
+    bytes_freed = 0
+    patterns = [
+        "**/*__rltmp_*.xml",
+        "**/*__desktex_rl_*.xml",
+        "_desk_textures/rl_*",
+    ]
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for p in wrappers_dir.glob(pattern):
+            pp = p.resolve()
+            if pp in seen or (not pp.exists()) or (not pp.is_file()):
+                continue
+            seen.add(pp)
+            try:
+                bytes_freed += int(pp.stat().st_size)
+            except Exception:
+                pass
+            try:
+                pp.unlink()
+                removed += 1
+            except Exception:
+                pass
+
+    if is_main and removed > 0:
+        gb = bytes_freed / (1024.0 ** 3)
+        print(
+            f"[env] Pruned stale generated wrapper artifacts: removed={removed}, freed={gb:.2f} GiB",
+            flush=True,
+        )
+
+    _broadcast_object({"removed": removed}, rank)
 
 
 def _resolve_and_prepare_vla_path(vla_path: str) -> str:
@@ -1082,6 +1253,7 @@ class CDPRVisionLanguageEnv:
         import cdpr_dataset.rl_cdpr_env as rl_env_module
         CDPRLanguageRLEnv = rl_env_module.CDPRLanguageRLEnv
         _apply_cdpr_env_runtime_shims(CDPRLanguageRLEnv, rl_env_module)
+        self._rl_env_module = rl_env_module
 
         self.env = CDPRLanguageRLEnv(
             catalog_path=catalog_path,
@@ -1101,6 +1273,8 @@ class CDPRVisionLanguageEnv:
         self._instruction = ""
         self.invert_x_action = bool(invert_x_action)
         self.invert_y_action = bool(invert_y_action)
+        self._scene_wrapper_cache: Dict[str, List[Path]] = {}
+        self._texture_name_by_wrapper: Dict[str, str] = {}
 
     @staticmethod
     def _attach_state(obs_out: Dict[str, Any], raw_obs: Any) -> None:
@@ -1108,10 +1282,16 @@ class CDPRVisionLanguageEnv:
             return
         ee = raw_obs.get("ee_position")
         tgt = raw_obs.get("target_object_position")
+        all_obj = raw_obs.get("all_object_positions")
+        obj_mask = raw_obs.get("object_position_mask")
         if ee is not None:
             obs_out["ee_position"] = np.asarray(ee, dtype=np.float32)
         if tgt is not None:
             obs_out["target_object_position"] = np.asarray(tgt, dtype=np.float32)
+        if all_obj is not None:
+            obs_out["all_object_positions"] = np.asarray(all_obj, dtype=np.float32)
+        if obj_mask is not None:
+            obs_out["object_position_mask"] = np.asarray(obj_mask, dtype=np.float32)
 
     def reset(self, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         try:
@@ -1145,6 +1325,117 @@ class CDPRVisionLanguageEnv:
             if name:
                 out.append(str(name))
         return out
+
+    @staticmethod
+    def _safe_cache_tag(text: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_\\-]+", "_", str(text))[:96]
+
+    def enable_prebuilt_scene_cache(
+        self,
+        scene_pool_size: int,
+        texture_pool_size: int,
+        seed: int,
+    ) -> Dict[str, int]:
+        rl = self.env
+        rl_mod = self._rl_env_module
+
+        scenes_all = list(getattr(rl, "scenes", []) or [])
+        if not scenes_all:
+            return {"scenes": 0, "variants": 0, "textures": 0}
+
+        rng = np.random.default_rng(int(seed))
+        if int(scene_pool_size) > 0 and len(scenes_all) > int(scene_pool_size):
+            chosen_idx = np.sort(rng.choice(len(scenes_all), size=int(scene_pool_size), replace=False))
+            scenes = [scenes_all[int(i)] for i in chosen_idx]
+        else:
+            scenes = scenes_all
+
+        try:
+            build_wrapper_if_needed = rl_mod._import_wrapper_builder()
+        except Exception:
+            from cdpr_dataset.generate_cdpr_dataset import build_wrapper_if_needed
+
+        texture_files = list(getattr(rl, "desk_texture_files", []) or [])
+        if int(texture_pool_size) > 0 and len(texture_files) > int(texture_pool_size):
+            tex_idx = np.sort(rng.choice(len(texture_files), size=int(texture_pool_size), replace=False))
+            texture_files = [texture_files[int(i)] for i in tex_idx]
+
+        cache: Dict[str, List[Path]] = {}
+        texture_name_by_wrapper: Dict[str, str] = {}
+        total_variants = 0
+
+        for scene in scenes:
+            scene_name = str(getattr(scene, "name", ""))
+            scene_objects = list(getattr(scene, "objects", []))
+            if not scene_name or not scene_objects:
+                continue
+
+            base_wrapper = Path(
+                build_wrapper_if_needed(
+                    scene_name=scene_name,
+                    object_names=scene_objects,
+                    scene_z=rl.defaults.get("scene_z", -0.85),
+                    ee_start=rl.defaults.get("ee_start", (0.0, 0.0, 0.25)),
+                    table_z=rl.defaults.get("table_z", 0.15),
+                    settle_time=rl.defaults.get("settle_time", 1.0),
+                    wrapper_out=None,
+                    use_cache=True,
+                )
+            ).resolve()
+
+            variants: List[Path] = []
+            if texture_files:
+                for tex_idx_local, tex in enumerate(texture_files):
+                    tex_path = Path(tex).resolve()
+                    tag = self._safe_cache_tag(f"cache_{scene_name}_{tex_idx_local}_{tex_path.stem}")
+                    patched = rl_mod._build_textured_wrapper_variant(
+                        base_wrapper_xml=base_wrapper,
+                        chosen_texture=tex_path,
+                        variant_tag=tag,
+                        desk_geom_regex=rl.desk_geom_regex,
+                        desk_texrepeat=rl.desk_texrepeat,
+                    )
+                    wrapper_path = Path(patched.wrapper_xml).resolve()
+                    variants.append(wrapper_path)
+                    texture_name_by_wrapper[str(wrapper_path)] = tex_path.name
+            else:
+                variants.append(base_wrapper)
+                texture_name_by_wrapper[str(base_wrapper)] = ""
+
+            if variants:
+                cache[scene_name] = variants
+                total_variants += len(variants)
+
+        if not cache:
+            return {"scenes": 0, "variants": 0, "textures": len(texture_files)}
+
+        # Restrict env sampling to cached scenes and force wrapper reuse.
+        cached_scene_names = set(cache.keys())
+        rl.scenes = [s for s in scenes if str(getattr(s, "name", "")) in cached_scene_names]
+        self._scene_wrapper_cache = cache
+        self._texture_name_by_wrapper = texture_name_by_wrapper
+
+        def _build_wrapper_cached(this, scene):
+            scene_name = str(getattr(scene, "name", ""))
+            variants_local = self._scene_wrapper_cache.get(scene_name)
+            if variants_local:
+                idx = int(this.np_random.integers(0, len(variants_local)))
+                chosen = Path(variants_local[idx]).resolve()
+                this._desk_texture_name = self._texture_name_by_wrapper.get(str(chosen), "")
+                return chosen
+            return this._build_wrapper_original(scene)
+
+        if not hasattr(rl, "_build_wrapper_original"):
+            rl._build_wrapper_original = rl._build_wrapper
+        rl._build_wrapper = types.MethodType(_build_wrapper_cached, rl)
+        rl.wrapper_cleanup = False
+        rl.use_wrapper_cache = True
+
+        return {
+            "scenes": len(cache),
+            "variants": total_variants,
+            "textures": len(texture_files),
+        }
 
     def step(self, action: np.ndarray):
         action_env = np.asarray(action, dtype=np.float32).copy()
@@ -1271,6 +1562,104 @@ def _float_or_none(value: Optional[float]) -> Optional[float]:
     if not math.isfinite(value_f):
         return None
     return value_f
+
+
+def _vec3_or_nan(value: Any) -> np.ndarray:
+    if value is None:
+        return np.full((3,), np.nan, dtype=np.float32)
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    out = np.full((3,), np.nan, dtype=np.float32)
+    n = min(3, int(arr.shape[0]))
+    if n > 0:
+        out[:n] = arr[:n]
+    return out
+
+
+def _stack_or_object(arrays: List[np.ndarray]) -> np.ndarray:
+    if not arrays:
+        return np.asarray([], dtype=np.float32)
+    shapes = {tuple(a.shape) for a in arrays}
+    if len(shapes) == 1:
+        return np.stack(arrays, axis=0)
+    return np.asarray(arrays, dtype=object)
+
+
+def save_rollout_tap_npz(
+    run_dir: Path,
+    update: int,
+    records: List[Dict[str, Any]],
+) -> Optional[Path]:
+    if not records:
+        return None
+
+    out_dir = run_dir / "rollout_tap"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"update_{int(update):05d}.npz"
+
+    all_obj_before = [
+        np.asarray(r["all_object_positions_before"], dtype=np.float32)
+        if r["all_object_positions_before"] is not None
+        else np.full((0, 3), np.nan, dtype=np.float32)
+        for r in records
+    ]
+    all_obj_after = [
+        np.asarray(r["all_object_positions_after"], dtype=np.float32)
+        if r["all_object_positions_after"] is not None
+        else np.full((0, 3), np.nan, dtype=np.float32)
+        for r in records
+    ]
+    all_obj_mask_before = [
+        np.asarray(r["object_position_mask_before"], dtype=np.float32)
+        if r["object_position_mask_before"] is not None
+        else np.full((0,), np.nan, dtype=np.float32)
+        for r in records
+    ]
+    all_obj_mask_after = [
+        np.asarray(r["object_position_mask_after"], dtype=np.float32)
+        if r["object_position_mask_after"] is not None
+        else np.full((0,), np.nan, dtype=np.float32)
+        for r in records
+    ]
+
+    data = {
+        "update": np.asarray([int(update)] * len(records), dtype=np.int32),
+        "global_step": np.asarray([int(r["global_step"]) for r in records], dtype=np.int64),
+        "step_in_update": np.asarray([int(r["step_in_update"]) for r in records], dtype=np.int32),
+        "action_delta": np.asarray([r["action_delta"] for r in records], dtype=np.float32),
+        "action_delta_norm": np.asarray([float(r["action_delta_norm"]) for r in records], dtype=np.float32),
+        "reward_env": np.asarray([float(r["reward_env"]) for r in records], dtype=np.float32),
+        "reward_shaped": np.asarray([float(r["reward_shaped"]) for r in records], dtype=np.float32),
+        "closer_bonus": np.asarray([float(r["closer_bonus"]) for r in records], dtype=np.float32),
+        "farther_penalty": np.asarray([float(r["farther_penalty"]) for r in records], dtype=np.float32),
+        "distance_before": np.asarray(
+            [np.nan if r["distance_before"] is None else float(r["distance_before"]) for r in records],
+            dtype=np.float32,
+        ),
+        "distance_after": np.asarray(
+            [np.nan if r["distance_after"] is None else float(r["distance_after"]) for r in records],
+            dtype=np.float32,
+        ),
+        "distance_delta_raw": np.asarray([float(r["distance_delta_raw"]) for r in records], dtype=np.float32),
+        "ee_position_before": np.asarray([_vec3_or_nan(r["ee_position_before"]) for r in records], dtype=np.float32),
+        "ee_position_after": np.asarray([_vec3_or_nan(r["ee_position_after"]) for r in records], dtype=np.float32),
+        "target_position_before": np.asarray([_vec3_or_nan(r["target_position_before"]) for r in records], dtype=np.float32),
+        "target_position_after": np.asarray([_vec3_or_nan(r["target_position_after"]) for r in records], dtype=np.float32),
+        "all_object_positions_before": _stack_or_object(all_obj_before),
+        "all_object_positions_after": _stack_or_object(all_obj_after),
+        "object_position_mask_before": _stack_or_object(all_obj_mask_before),
+        "object_position_mask_after": _stack_or_object(all_obj_mask_after),
+        "value_pred": np.asarray([float(r["value_pred"]) for r in records], dtype=np.float32),
+        "logprob": np.asarray([float(r["logprob"]) for r in records], dtype=np.float32),
+        "scene": np.asarray([str(r["scene"]) for r in records], dtype=object),
+        "instruction": np.asarray([str(r["instruction"]) for r in records], dtype=object),
+        "instruction_type": np.asarray([str(r["instruction_type"]) for r in records], dtype=object),
+        "target_object_catalog": np.asarray([str(r["target_object_catalog"]) for r in records], dtype=object),
+        "env_done": np.asarray([bool(r["env_done"]) for r in records], dtype=bool),
+        "forced_scene_refresh": np.asarray([bool(r["forced_scene_refresh"]) for r in records], dtype=bool),
+    }
+
+    np.savez_compressed(out_path, **data)
+    return out_path
 
 
 def run_validation_rollouts(
@@ -1442,6 +1831,12 @@ def main() -> None:
         args.scene_refresh_every_steps = -1
     if args.validate_every_updates == 0:
         args.validate_every_updates = -1
+    if args.rollout_tap_every_updates == 0:
+        args.rollout_tap_every_updates = -1
+    if args.scene_pool_size == 0:
+        args.scene_pool_size = -1
+    if args.texture_pool_size == 0:
+        args.texture_pool_size = -1
     if args.microbatch_size > args.minibatch_size:
         print(
             f"[WARN] --microbatch_size ({args.microbatch_size}) > --minibatch_size ({args.minibatch_size}); "
@@ -1510,6 +1905,20 @@ def main() -> None:
         save_run_config(args, run_dir_local)
         print(f"Run dir: {run_dir_local}", flush=True)
     run_dir = Path(_broadcast_object(str(run_dir_local) if run_dir_local is not None else None, rank))
+
+    cdpr_root = _resolve_cdpr_dataset_root(Path(args.cdpr_dataset_root))
+    _prune_generated_wrapper_artifacts(
+        cdpr_dataset_root=cdpr_root,
+        is_main=is_main,
+        rank=rank,
+    )
+
+    args.desk_textures_dir = _prepare_desk_textures_dir(
+        src_dir=args.desk_textures_dir,
+        run_dir=run_dir,
+        is_main=is_main,
+        rank=rank,
+    )
 
     vla, processor = load_vla_and_processor(args, device)
     maybe_enable_gradient_checkpointing(vla, enabled=bool(args.gradient_checkpointing))
@@ -1609,6 +2018,19 @@ def main() -> None:
                 seed=args.seed + rank,
             )
 
+        if args.prebuild_scene_cache:
+            cache_info = env.enable_prebuilt_scene_cache(
+                scene_pool_size=args.scene_pool_size,
+                texture_pool_size=args.texture_pool_size,
+                seed=args.seed + 20_000 + rank,
+            )
+            if is_main:
+                print(
+                    f"[env_cache] train scenes={cache_info['scenes']} "
+                    f"variants={cache_info['variants']} textures={cache_info['textures']}",
+                    flush=True,
+                )
+
         scene_names, next_reset_options = _make_scene_reset_sampler(
             scene_names=env.scene_names(),
             scene_sampling=args.scene_sampling,
@@ -1620,8 +2042,13 @@ def main() -> None:
                 f"[env] scene_sampling={args.scene_sampling} "
                 f"scene_refresh_every_steps={args.scene_refresh_every_steps} "
                 f"catalog_scenes={len(scene_names)} "
+                f"prebuild_scene_cache={bool(args.prebuild_scene_cache)} "
+                f"scene_pool_size={args.scene_pool_size} "
+                f"texture_pool_size={args.texture_pool_size} "
                 f"delta_closer_reward_coef={args.delta_closer_reward_coef} "
-                f"delta_farther_penalty_coef={args.delta_farther_penalty_coef}",
+                f"delta_farther_penalty_coef={args.delta_farther_penalty_coef} "
+                f"validate_every_updates={args.validate_every_updates} "
+                f"rollout_tap_every_updates={args.rollout_tap_every_updates}",
                 flush=True,
             )
             if len(scene_names) < 2:
@@ -1656,6 +2083,17 @@ def main() -> None:
                     invert_y_action=args.invert_y_action,
                     seed=args.seed + 50_000,
                 )
+            if args.prebuild_scene_cache:
+                val_cache_info = val_env.enable_prebuilt_scene_cache(
+                    scene_pool_size=args.scene_pool_size,
+                    texture_pool_size=args.texture_pool_size,
+                    seed=args.seed + 70_000,
+                )
+                print(
+                    f"[env_cache] val scenes={val_cache_info['scenes']} "
+                    f"variants={val_cache_info['variants']} textures={val_cache_info['textures']}",
+                    flush=True,
+                )
             _, next_val_reset_options = _make_scene_reset_sampler(
                 scene_names=val_env.scene_names(),
                 scene_sampling=args.scene_sampling,
@@ -1668,6 +2106,7 @@ def main() -> None:
         for update in range(1, args.total_updates + 1):
             policy.eval()
             transitions: List[Transition] = []
+            rollout_records: List[Dict[str, Any]] = []
             episode_returns = []
             episode_returns_env = []
             ep_ret = 0.0
@@ -1724,6 +2163,38 @@ def main() -> None:
                         done=float(done),
                         value=float(value.item()),
                     )
+                )
+
+                rollout_records.append(
+                    {
+                        "global_step": int(global_step),
+                        "step_in_update": int(len(rollout_records)),
+                        "action_delta": action_np.astype(np.float32),
+                        "action_delta_norm": float(np.linalg.norm(action_np)),
+                        "reward_env": float(env_reward),
+                        "reward_shaped": float(reward),
+                        "closer_bonus": float(closer_bonus),
+                        "farther_penalty": float(farther_penalty),
+                        "distance_before": _float_or_none(dist_before),
+                        "distance_after": _float_or_none(dist_after),
+                        "distance_delta_raw": float(raw_dist_delta),
+                        "ee_position_before": obs.get("ee_position"),
+                        "ee_position_after": next_obs.get("ee_position"),
+                        "target_position_before": obs.get("target_object_position"),
+                        "target_position_after": next_obs.get("target_object_position"),
+                        "all_object_positions_before": obs.get("all_object_positions"),
+                        "all_object_positions_after": next_obs.get("all_object_positions"),
+                        "object_position_mask_before": obs.get("object_position_mask"),
+                        "object_position_mask_after": next_obs.get("object_position_mask"),
+                        "value_pred": float(value.item()),
+                        "logprob": float(logprob_t.item()),
+                        "scene": str(step_info.get("scene", "")),
+                        "instruction": str(obs.get("instruction", "")),
+                        "instruction_type": str(step_info.get("instruction_type", "")),
+                        "target_object_catalog": str(step_info.get("target_object_catalog", "")),
+                        "env_done": bool(env_done),
+                        "forced_scene_refresh": bool(forced_scene_refresh),
+                    }
                 )
 
                 ep_ret += float(reward)
@@ -1903,6 +2374,22 @@ def main() -> None:
                     f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
                     flush=True,
                 )
+
+            if (
+                is_main
+                and args.rollout_tap_every_updates > 0
+                and (update % args.rollout_tap_every_updates == 0)
+            ):
+                tap_path = save_rollout_tap_npz(
+                    run_dir=run_dir,
+                    update=update,
+                    records=rollout_records,
+                )
+                if tap_path is not None:
+                    print(
+                        f"[rollout_tap u{update:05d}] path={tap_path} steps={len(rollout_records)}",
+                        flush=True,
+                    )
 
             if (
                 is_main
