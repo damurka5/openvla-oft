@@ -180,6 +180,26 @@ def parse_args() -> argparse.Namespace:
         help="Optional subset: pick_up move_left move_right move_top move_bottom",
     )
     ap.add_argument(
+        "--scene_sampling",
+        type=str,
+        choices=["env_random", "round_robin", "random"],
+        default="round_robin",
+        help=(
+            "How to pick scene on reset. "
+            "`env_random` lets CDPR env sample; `round_robin` cycles catalog scenes; "
+            "`random` samples a scene uniformly each reset."
+        ),
+    )
+    ap.add_argument(
+        "--scene_refresh_every_steps",
+        type=int,
+        default=1,
+        help=(
+            "Force reset every N interaction steps to resample scene/object positions/instruction. "
+            "Use <=0 to disable forced refresh and reset only on env termination."
+        ),
+    )
+    ap.add_argument(
         "--invert_x_action",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -193,7 +213,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # PPO
-    ap.add_argument("--total_updates", type=int, default=3000)
+    ap.add_argument("--total_updates", type=int, default=70)
     ap.add_argument("--rollout_steps", type=int, default=256)
     ap.add_argument("--ppo_epochs", type=int, default=4)
     ap.add_argument("--minibatch_size", type=int, default=4)
@@ -1039,8 +1059,12 @@ class CDPRVisionLanguageEnv:
         self.invert_x_action = bool(invert_x_action)
         self.invert_y_action = bool(invert_y_action)
 
-    def reset(self) -> Dict[str, Any]:
-        _, info = self.env.reset()
+    def reset(self, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            _, info = self.env.reset(options=options)
+        except TypeError:
+            # Backward compatibility with env variants that don't accept `options`.
+            _, info = self.env.reset()
         self._instruction = str(info.get("language_instruction", ""))
 
         # Ensure at least one captured frame exists after reset.
@@ -1055,6 +1079,17 @@ class CDPRVisionLanguageEnv:
             "instruction": self._instruction,
         }
         return obs
+
+    def scene_names(self) -> List[str]:
+        scenes = getattr(self.env, "scenes", None)
+        if scenes is None:
+            return []
+        out: List[str] = []
+        for scene in scenes:
+            name = getattr(scene, "name", None)
+            if name:
+                out.append(str(name))
+        return out
 
     def step(self, action: np.ndarray):
         action_env = np.asarray(action, dtype=np.float32).copy()
@@ -1143,6 +1178,8 @@ def main() -> None:
         raise ValueError("--minibatch_size must be >= 1.")
     if args.microbatch_size < 1:
         raise ValueError("--microbatch_size must be >= 1.")
+    if args.scene_refresh_every_steps == 0:
+        args.scene_refresh_every_steps = -1
     if args.microbatch_size > args.minibatch_size:
         print(
             f"[WARN] --microbatch_size ({args.microbatch_size}) > --minibatch_size ({args.minibatch_size}); "
@@ -1309,8 +1346,38 @@ def main() -> None:
                 seed=args.seed + rank,
             )
 
+        scene_names = env.scene_names()
+        scene_rng = np.random.default_rng(args.seed + 10_000 + rank)
+        scene_cursor = 0
+
+        if is_main:
+            print(
+                f"[env] scene_sampling={args.scene_sampling} "
+                f"scene_refresh_every_steps={args.scene_refresh_every_steps} "
+                f"catalog_scenes={len(scene_names)}",
+                flush=True,
+            )
+            if len(scene_names) < 2:
+                print(
+                    "[WARN] Catalog has fewer than 2 scenes. "
+                    "For stronger visual diversity, add more scenes to catalog YAML.",
+                    flush=True,
+                )
+
+        def next_reset_options() -> Optional[Dict[str, Any]]:
+            nonlocal scene_cursor
+
+            if len(scene_names) == 0 or args.scene_sampling == "env_random":
+                return None
+            if args.scene_sampling == "random":
+                scene = scene_names[int(scene_rng.integers(0, len(scene_names)))]
+            else:
+                scene = scene_names[scene_cursor % len(scene_names)]
+                scene_cursor += 1
+            return {"scene": scene}
+
         with _silence_stdio(bool(args.quiet_env_logs)):
-            obs = env.reset()
+            obs = env.reset(options=next_reset_options())
 
         if use_tqdm:
             updates_pbar = tqdm(total=args.total_updates, desc="updates", dynamic_ncols=True, leave=True)
@@ -1343,7 +1410,13 @@ def main() -> None:
                     logprob_t = gaussian_log_prob(action_t, mean_action, std_action).sum(dim=-1)
 
                 action_np = action_t[0].cpu().numpy().astype(np.float32)
-                next_obs, reward, done, step_info = env.step(action_np)
+                next_obs, reward, env_done, step_info = env.step(action_np)
+                global_step += 1
+                forced_scene_refresh = (
+                    args.scene_refresh_every_steps > 0
+                    and (global_step % args.scene_refresh_every_steps == 0)
+                )
+                done = bool(env_done or forced_scene_refresh)
 
                 transitions.append(
                     Transition(
@@ -1359,7 +1432,6 @@ def main() -> None:
                 )
 
                 ep_ret += float(reward)
-                global_step += 1
                 obs = next_obs
 
                 if done:
@@ -1378,6 +1450,8 @@ def main() -> None:
                             "instruction": str(step_info.get("language_instruction", "")),
                             "instruction_type": str(step_info.get("instruction_type", "")),
                             "success": bool(step_info.get("success", False)),
+                            "env_done": bool(env_done),
+                            "forced_scene_refresh": bool(forced_scene_refresh),
                             "reward": float(step_info.get("reward", reward)),
                             "desk_texture": str(step_info.get("desk_texture", "")),
                         }
@@ -1385,7 +1459,7 @@ def main() -> None:
                         trace_fp.flush()
 
                     with _silence_stdio(bool(args.quiet_env_logs)):
-                        obs = env.reset()
+                        obs = env.reset(options=next_reset_options())
 
                 if rollout_pbar is not None:
                     rollout_pbar.update(1)
