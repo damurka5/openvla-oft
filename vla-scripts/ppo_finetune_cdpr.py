@@ -235,6 +235,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--learning_rate", type=float, default=1e-5)
     ap.add_argument("--value_lr", type=float, default=1e-4)
     ap.add_argument("--init_log_std", type=float, default=-1.2)
+    ap.add_argument(
+        "--delta_closer_reward_coef",
+        type=float,
+        default=5.0,
+        help=(
+            "Extra reward coefficient for positive reduction in EE-to-target distance "
+            "(delta action moves closer to target)."
+        ),
+    )
 
     # Runtime
     ap.add_argument("--seed", type=int, default=7)
@@ -278,6 +287,30 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional JSONL file to log scene/object/instruction/success per completed episode (rank 0).",
+    )
+    ap.add_argument(
+        "--validate_every_updates",
+        type=int,
+        default=10,
+        help="Run deterministic validation rollouts every N PPO updates (rank 0). Use <=0 to disable.",
+    )
+    ap.add_argument(
+        "--validation_episodes",
+        type=int,
+        default=1,
+        help="Number of validation episodes per validation run.",
+    )
+    ap.add_argument(
+        "--validation_max_steps",
+        type=int,
+        default=40,
+        help="Maximum steps per validation episode.",
+    )
+    ap.add_argument(
+        "--save_validation_frames",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save overview/wrist PNG frames during periodic validation rollouts.",
     )
     ap.add_argument("--run_root_dir", type=str, default="runs_ppo")
     ap.add_argument("--run_id", type=str, default=None)
@@ -979,6 +1012,7 @@ class Transition:
     instruction: str
     action: np.ndarray
     logprob: float
+    env_reward: float
     reward: float
     done: float
     value: float
@@ -1059,12 +1093,23 @@ class CDPRVisionLanguageEnv:
         self.invert_x_action = bool(invert_x_action)
         self.invert_y_action = bool(invert_y_action)
 
+    @staticmethod
+    def _attach_state(obs_out: Dict[str, Any], raw_obs: Any) -> None:
+        if not isinstance(raw_obs, dict):
+            return
+        ee = raw_obs.get("ee_position")
+        tgt = raw_obs.get("target_object_position")
+        if ee is not None:
+            obs_out["ee_position"] = np.asarray(ee, dtype=np.float32)
+        if tgt is not None:
+            obs_out["target_object_position"] = np.asarray(tgt, dtype=np.float32)
+
     def reset(self, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         try:
-            _, info = self.env.reset(options=options)
+            raw_obs, info = self.env.reset(options=options)
         except TypeError:
             # Backward compatibility with env variants that don't accept `options`.
-            _, info = self.env.reset()
+            raw_obs, info = self.env.reset()
         self._instruction = str(info.get("language_instruction", ""))
 
         # Ensure at least one captured frame exists after reset.
@@ -1078,6 +1123,7 @@ class CDPRVisionLanguageEnv:
             "image_wrist": _latest_image_from_sim(self.env.sim, wrist=True),
             "instruction": self._instruction,
         }
+        self._attach_state(obs, raw_obs)
         return obs
 
     def scene_names(self) -> List[str]:
@@ -1097,7 +1143,7 @@ class CDPRVisionLanguageEnv:
             action_env[0] *= -1.0
         if self.invert_y_action:
             action_env[1] *= -1.0
-        _, reward, terminated, truncated, info = self.env.step(action_env)
+        raw_obs, reward, terminated, truncated, info = self.env.step(action_env)
         self._instruction = str(info.get("language_instruction", self._instruction))
 
         obs = {
@@ -1105,6 +1151,7 @@ class CDPRVisionLanguageEnv:
             "image_wrist": _latest_image_from_sim(self.env.sim, wrist=True),
             "instruction": self._instruction,
         }
+        self._attach_state(obs, raw_obs)
         done = bool(terminated or truncated)
         return obs, float(reward), done, info
 
@@ -1147,6 +1194,201 @@ def gaussian_entropy(std: torch.Tensor) -> torch.Tensor:
     return 0.5 + 0.5 * math.log(2.0 * math.pi) + torch.log(std)
 
 
+def _distance_ee_to_target_from_obs(obs: Dict[str, Any]) -> Optional[float]:
+    ee = obs.get("ee_position")
+    tgt = obs.get("target_object_position")
+    if ee is None or tgt is None:
+        return None
+
+    ee_arr = np.asarray(ee, dtype=np.float32).reshape(-1)
+    tgt_arr = np.asarray(tgt, dtype=np.float32).reshape(-1)
+    if ee_arr.shape[0] < 3 or tgt_arr.shape[0] < 3:
+        return None
+    return float(np.linalg.norm(ee_arr[:3] - tgt_arr[:3]))
+
+
+def _shape_reward_with_delta_progress(
+    env_reward: float,
+    distance_before: Optional[float],
+    distance_after: Optional[float],
+    delta_closer_reward_coef: float,
+) -> Tuple[float, float, float]:
+    if distance_before is None or distance_after is None:
+        return float(env_reward), 0.0, 0.0
+    raw_delta = float(distance_before - distance_after)
+    closer_bonus = float(max(raw_delta, 0.0) * max(float(delta_closer_reward_coef), 0.0))
+    shaped_reward = float(env_reward + closer_bonus)
+    return shaped_reward, closer_bonus, raw_delta
+
+
+def _make_scene_reset_sampler(
+    scene_names: Sequence[str],
+    scene_sampling: str,
+    seed: int,
+):
+    names = [str(x) for x in scene_names if str(x)]
+    rng = np.random.default_rng(seed)
+    cursor = 0
+
+    def _next_options() -> Optional[Dict[str, Any]]:
+        nonlocal cursor
+        if len(names) == 0 or scene_sampling == "env_random":
+            return None
+        if scene_sampling == "random":
+            scene = names[int(rng.integers(0, len(names)))]
+        else:
+            scene = names[cursor % len(names)]
+            cursor += 1
+        return {"scene": scene}
+
+    return names, _next_options
+
+
+def _to_uint8_rgb(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image)
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[:, :, None], repeats=3, axis=2)
+    return arr
+
+
+def _float_or_none(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    value_f = float(value)
+    if not math.isfinite(value_f):
+        return None
+    return value_f
+
+
+def run_validation_rollouts(
+    *,
+    policy_core: OpenVLAPPOPolicy,
+    val_env: CDPRVisionLanguageEnv,
+    run_dir: Path,
+    update: int,
+    num_episodes: int,
+    max_steps: int,
+    num_images_in_input: int,
+    delta_closer_reward_coef: float,
+    save_frames: bool,
+    quiet_env_logs: bool,
+    next_reset_options,
+) -> Dict[str, Any]:
+    val_root = run_dir / "validation" / f"update_{update:05d}"
+    val_root.mkdir(parents=True, exist_ok=True)
+
+    episode_env_returns: List[float] = []
+    episode_shaped_returns: List[float] = []
+    episode_successes: List[float] = []
+
+    for ep_idx in range(1, int(num_episodes) + 1):
+        ep_dir = val_root / f"episode_{ep_idx:02d}"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+
+        with _silence_stdio(bool(quiet_env_logs)):
+            obs = val_env.reset(options=next_reset_options())
+
+        env_return = 0.0
+        shaped_return = 0.0
+        success = False
+        steps: List[Dict[str, Any]] = []
+
+        for step_idx in range(int(max_steps)):
+            if save_frames:
+                Image.fromarray(_to_uint8_rgb(obs["image_primary"])).save(ep_dir / f"overview_{step_idx:03d}.png")
+                wrist = obs.get("image_wrist")
+                if wrist is not None:
+                    Image.fromarray(_to_uint8_rgb(wrist)).save(ep_dir / f"wrist_{step_idx:03d}.png")
+
+            with torch.no_grad():
+                mean_action, std_action, value = policy_core(
+                    images_primary=[obs["image_primary"]],
+                    images_wrist=[obs["image_wrist"]] if num_images_in_input > 1 else None,
+                    instructions=[obs["instruction"]],
+                )
+            action_np = torch.clamp(mean_action, -1.0, 1.0)[0].cpu().numpy().astype(np.float32)
+
+            dist_before = _distance_ee_to_target_from_obs(obs)
+            with _silence_stdio(bool(quiet_env_logs)):
+                next_obs, env_reward, done, info = val_env.step(action_np)
+            dist_after = _distance_ee_to_target_from_obs(next_obs)
+
+            shaped_reward, closer_bonus, raw_delta = _shape_reward_with_delta_progress(
+                env_reward=env_reward,
+                distance_before=dist_before,
+                distance_after=dist_after,
+                delta_closer_reward_coef=delta_closer_reward_coef,
+            )
+
+            env_return += float(env_reward)
+            shaped_return += float(shaped_reward)
+            success = bool(info.get("success", success))
+
+            steps.append(
+                {
+                    "step": int(step_idx),
+                    "instruction": str(obs.get("instruction", "")),
+                    "scene": str(info.get("scene", "")),
+                    "target_object_catalog": str(info.get("target_object_catalog", "")),
+                    "action_delta": action_np.tolist(),
+                    "action_delta_norm": float(np.linalg.norm(action_np)),
+                    "value_pred": float(value.item()),
+                    "std_mean": float(std_action.mean().item()),
+                    "reward_env": float(env_reward),
+                    "reward_shaped": float(shaped_reward),
+                    "closer_bonus": float(closer_bonus),
+                    "distance_delta_raw": float(raw_delta),
+                    "distance_before": _float_or_none(dist_before),
+                    "distance_after": _float_or_none(dist_after),
+                    "success": bool(info.get("success", False)),
+                    "done": bool(done),
+                }
+            )
+
+            obs = next_obs
+            if done:
+                break
+
+        steps_path = ep_dir / "steps.jsonl"
+        with steps_path.open("w", encoding="utf-8") as f_steps:
+            for row in steps:
+                f_steps.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        summary_path = ep_dir / "summary.json"
+        with summary_path.open("w", encoding="utf-8") as f_ep:
+            json.dump(
+                {
+                    "update": int(update),
+                    "episode": int(ep_idx),
+                    "env_return": float(env_return),
+                    "shaped_return": float(shaped_return),
+                    "success": bool(success),
+                    "num_steps": int(len(steps)),
+                },
+                f_ep,
+                indent=2,
+                sort_keys=True,
+            )
+
+        episode_env_returns.append(float(env_return))
+        episode_shaped_returns.append(float(shaped_return))
+        episode_successes.append(1.0 if success else 0.0)
+
+    out = {
+        "update": int(update),
+        "episodes": int(num_episodes),
+        "mean_env_return": float(np.mean(episode_env_returns)) if episode_env_returns else 0.0,
+        "mean_shaped_return": float(np.mean(episode_shaped_returns)) if episode_shaped_returns else 0.0,
+        "success_rate": float(np.mean(episode_successes)) if episode_successes else 0.0,
+        "path": str(val_root),
+    }
+    with (val_root / "summary.json").open("w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, sort_keys=True)
+    return out
+
+
 def save_checkpoint(
     run_dir: Path,
     step: int,
@@ -1178,8 +1420,14 @@ def main() -> None:
         raise ValueError("--minibatch_size must be >= 1.")
     if args.microbatch_size < 1:
         raise ValueError("--microbatch_size must be >= 1.")
+    if args.validation_episodes < 1:
+        raise ValueError("--validation_episodes must be >= 1.")
+    if args.validation_max_steps < 1:
+        raise ValueError("--validation_max_steps must be >= 1.")
     if args.scene_refresh_every_steps == 0:
         args.scene_refresh_every_steps = -1
+    if args.validate_every_updates == 0:
+        args.validate_every_updates = -1
     if args.microbatch_size > args.minibatch_size:
         print(
             f"[WARN] --microbatch_size ({args.microbatch_size}) > --minibatch_size ({args.minibatch_size}); "
@@ -1314,6 +1562,7 @@ def main() -> None:
         print("[WARN] tqdm is unavailable; falling back to periodic summary prints.", flush=True)
 
     env: Optional[CDPRVisionLanguageEnv] = None
+    val_env: Optional[CDPRVisionLanguageEnv] = None
     updates_pbar = None
     trace_fp = None
     global_step = 0
@@ -1346,15 +1595,18 @@ def main() -> None:
                 seed=args.seed + rank,
             )
 
-        scene_names = env.scene_names()
-        scene_rng = np.random.default_rng(args.seed + 10_000 + rank)
-        scene_cursor = 0
+        scene_names, next_reset_options = _make_scene_reset_sampler(
+            scene_names=env.scene_names(),
+            scene_sampling=args.scene_sampling,
+            seed=args.seed + 10_000 + rank,
+        )
 
         if is_main:
             print(
                 f"[env] scene_sampling={args.scene_sampling} "
                 f"scene_refresh_every_steps={args.scene_refresh_every_steps} "
-                f"catalog_scenes={len(scene_names)}",
+                f"catalog_scenes={len(scene_names)} "
+                f"delta_closer_reward_coef={args.delta_closer_reward_coef}",
                 flush=True,
             )
             if len(scene_names) < 2:
@@ -1364,20 +1616,36 @@ def main() -> None:
                     flush=True,
                 )
 
-        def next_reset_options() -> Optional[Dict[str, Any]]:
-            nonlocal scene_cursor
-
-            if len(scene_names) == 0 or args.scene_sampling == "env_random":
-                return None
-            if args.scene_sampling == "random":
-                scene = scene_names[int(scene_rng.integers(0, len(scene_names)))]
-            else:
-                scene = scene_names[scene_cursor % len(scene_names)]
-                scene_cursor += 1
-            return {"scene": scene}
-
         with _silence_stdio(bool(args.quiet_env_logs)):
             obs = env.reset(options=next_reset_options())
+
+        next_val_reset_options = None
+        if is_main and args.validate_every_updates > 0:
+            with _silence_stdio(bool(args.quiet_env_logs)):
+                val_env = CDPRVisionLanguageEnv(
+                    cdpr_dataset_root=Path(args.cdpr_dataset_root),
+                    cdpr_mujoco_root=args.cdpr_mujoco_root,
+                    catalog_path=args.catalog_path,
+                    max_steps=args.max_env_steps,
+                    action_step_xyz=args.action_step_xyz,
+                    action_step_yaw=args.action_step_yaw,
+                    capture_frames=args.capture_frames,
+                    instruction_types=args.instruction_types,
+                    desk_textures_dir=args.desk_textures_dir,
+                    allowed_objects=args.allowed_objects,
+                    desk_geom_regex=args.desk_geom_regex,
+                    desk_texrepeat=args.desk_texrepeat,
+                    wrapper_cleanup=args.wrapper_cleanup,
+                    use_wrapper_cache=args.use_wrapper_cache,
+                    invert_x_action=args.invert_x_action,
+                    invert_y_action=args.invert_y_action,
+                    seed=args.seed + 50_000,
+                )
+            _, next_val_reset_options = _make_scene_reset_sampler(
+                scene_names=val_env.scene_names(),
+                scene_sampling=args.scene_sampling,
+                seed=args.seed + 60_000,
+            )
 
         if use_tqdm:
             updates_pbar = tqdm(total=args.total_updates, desc="updates", dynamic_ncols=True, leave=True)
@@ -1386,7 +1654,9 @@ def main() -> None:
             policy.eval()
             transitions: List[Transition] = []
             episode_returns = []
+            episode_returns_env = []
             ep_ret = 0.0
+            ep_ret_env = 0.0
 
             rollout_pbar = (
                 tqdm(
@@ -1410,7 +1680,15 @@ def main() -> None:
                     logprob_t = gaussian_log_prob(action_t, mean_action, std_action).sum(dim=-1)
 
                 action_np = action_t[0].cpu().numpy().astype(np.float32)
-                next_obs, reward, env_done, step_info = env.step(action_np)
+                dist_before = _distance_ee_to_target_from_obs(obs)
+                next_obs, env_reward, env_done, step_info = env.step(action_np)
+                dist_after = _distance_ee_to_target_from_obs(next_obs)
+                reward, closer_bonus, raw_dist_delta = _shape_reward_with_delta_progress(
+                    env_reward=env_reward,
+                    distance_before=dist_before,
+                    distance_after=dist_after,
+                    delta_closer_reward_coef=args.delta_closer_reward_coef,
+                )
                 global_step += 1
                 forced_scene_refresh = (
                     args.scene_refresh_every_steps > 0
@@ -1425,6 +1703,7 @@ def main() -> None:
                         instruction=obs["instruction"],
                         action=action_np,
                         logprob=float(logprob_t.item()),
+                        env_reward=float(env_reward),
                         reward=float(reward),
                         done=float(done),
                         value=float(value.item()),
@@ -1432,11 +1711,14 @@ def main() -> None:
                 )
 
                 ep_ret += float(reward)
+                ep_ret_env += float(env_reward)
                 obs = next_obs
 
                 if done:
                     episode_returns.append(ep_ret)
+                    episode_returns_env.append(ep_ret_env)
                     ep_ret = 0.0
+                    ep_ret_env = 0.0
                     episode_idx += 1
 
                     if trace_fp is not None:
@@ -1452,7 +1734,12 @@ def main() -> None:
                             "success": bool(step_info.get("success", False)),
                             "env_done": bool(env_done),
                             "forced_scene_refresh": bool(forced_scene_refresh),
-                            "reward": float(step_info.get("reward", reward)),
+                            "reward_env": float(env_reward),
+                            "reward_shaped": float(reward),
+                            "closer_bonus": float(closer_bonus),
+                            "distance_delta_raw": float(raw_dist_delta),
+                            "distance_before": _float_or_none(dist_before),
+                            "distance_after": _float_or_none(dist_after),
                             "desk_texture": str(step_info.get("desk_texture", "")),
                         }
                         trace_fp.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -1476,6 +1763,7 @@ def main() -> None:
                 next_value = float(next_value_t.item())
 
             rewards = np.array([t.reward for t in transitions], dtype=np.float32)
+            env_rewards = np.array([t.env_reward for t in transitions], dtype=np.float32)
             dones = np.array([t.done for t in transitions], dtype=np.float32)
             values = np.array([t.value for t in transitions], dtype=np.float32)
             actions = np.stack([t.action for t in transitions], axis=0)
@@ -1573,23 +1861,57 @@ def main() -> None:
                 train_pbar.close()
 
             avg_rollout_reward = float(rewards.mean())
+            avg_rollout_reward_env = float(env_rewards.mean())
             avg_return = float(np.mean(episode_returns)) if episode_returns else ep_ret
+            avg_return_env = float(np.mean(episode_returns_env)) if episode_returns_env else ep_ret_env
 
             if updates_pbar is not None:
                 updates_pbar.update(1)
                 updates_pbar.set_postfix(
                     step=int(global_step),
-                    reward=f"{avg_rollout_reward:.3f}",
-                    ep_ret=f"{avg_return:.3f}",
+                    r_env=f"{avg_rollout_reward_env:.3f}",
+                    r_shape=f"{avg_rollout_reward:.3f}",
+                    ep_env=f"{avg_return_env:.3f}",
+                    ep_shape=f"{avg_return:.3f}",
                     log_std=f"{float(policy_core.log_std.mean().item()):.3f}",
                 )
             elif is_main:
                 print(
                     f"[update {update:05d}] "
                     f"global_step={global_step} "
-                    f"rollout_reward_mean={avg_rollout_reward:.4f} "
-                    f"episode_return_mean={avg_return:.4f} "
+                    f"rollout_reward_env_mean={avg_rollout_reward_env:.4f} "
+                    f"rollout_reward_shaped_mean={avg_rollout_reward:.4f} "
+                    f"episode_return_env_mean={avg_return_env:.4f} "
+                    f"episode_return_shaped_mean={avg_return:.4f} "
                     f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
+                    flush=True,
+                )
+
+            if (
+                is_main
+                and val_env is not None
+                and args.validate_every_updates > 0
+                and (update % args.validate_every_updates == 0)
+            ):
+                val_summary = run_validation_rollouts(
+                    policy_core=policy_core,
+                    val_env=val_env,
+                    run_dir=run_dir,
+                    update=update,
+                    num_episodes=args.validation_episodes,
+                    max_steps=args.validation_max_steps,
+                    num_images_in_input=args.num_images_in_input,
+                    delta_closer_reward_coef=args.delta_closer_reward_coef,
+                    save_frames=bool(args.save_validation_frames),
+                    quiet_env_logs=bool(args.quiet_env_logs),
+                    next_reset_options=next_val_reset_options,
+                )
+                print(
+                    f"[validation u{update:05d}] "
+                    f"env_return_mean={val_summary['mean_env_return']:.4f} "
+                    f"shaped_return_mean={val_summary['mean_shaped_return']:.4f} "
+                    f"success_rate={val_summary['success_rate']:.3f} "
+                    f"path={val_summary['path']}",
                     flush=True,
                 )
 
@@ -1620,6 +1942,9 @@ def main() -> None:
         if env is not None:
             with _silence_stdio(bool(args.quiet_env_logs)):
                 env.close()
+        if val_env is not None:
+            with _silence_stdio(bool(args.quiet_env_logs)):
+                val_env.close()
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
 
