@@ -650,7 +650,14 @@ class OpenVLAPPOPolicy(nn.Module):
         self.value_head = value_head
         self.device = device
         self.num_images_in_input = int(num_images_in_input)
-        self.log_std = nn.Parameter(torch.full((ACTION_DIM,), float(init_log_std), dtype=torch.float32))
+        self.log_std = nn.Parameter(
+            torch.full(
+                (ACTION_DIM,),
+                float(init_log_std),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        )
 
     def _core_model(self):
         # PEFT wrappers forward unknown attrs, but we keep a robust fallback here.
@@ -780,7 +787,12 @@ class OpenVLAPPOPolicy(nn.Module):
         action_chunk = torch.tanh(pred_pre)
         mean_action = action_chunk[:, 0, :].to(dtype=torch.float32)
 
-        std = torch.exp(self.log_std).unsqueeze(0).expand_as(mean_action).to(dtype=torch.float32)
+        std = (
+            torch.exp(self.log_std)
+            .unsqueeze(0)
+            .expand_as(mean_action)
+            .to(device=mean_action.device, dtype=torch.float32)
+        )
         dist = Normal(mean_action, std)
 
         current_action_hidden = action_hidden_states[:, :ACTION_DIM, :]
