@@ -192,7 +192,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--total_updates", type=int, default=3000)
     ap.add_argument("--rollout_steps", type=int, default=256)
     ap.add_argument("--ppo_epochs", type=int, default=4)
-    ap.add_argument("--minibatch_size", type=int, default=8)
+    ap.add_argument("--minibatch_size", type=int, default=4)
     ap.add_argument(
         "--microbatch_size",
         type=int,
@@ -230,7 +230,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--ddp_static_graph",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Use DDP static-graph mode when available (recommended with gradient checkpointing). "
             "Can avoid 'Expected to mark a variable ready only once' errors."
@@ -1132,6 +1132,19 @@ def main() -> None:
                 flush=True,
             )
         args.ddp_find_unused_parameters = False
+
+    # NOTE: Some PyTorch versions hit reducer/internal asserts when combining
+    # DDP + gradient checkpointing + multiple backward() calls per optimizer step.
+    # Keep one backward per step in multi-GPU mode for robustness.
+    if world_size > 1 and args.microbatch_size != args.minibatch_size:
+        if is_main:
+            print(
+                "[WARN] Multi-GPU mode uses one backward per optimizer step for stability on current PyTorch; "
+                "forcing --microbatch_size == --minibatch_size. "
+                "To reduce memory, lower --minibatch_size (e.g., 2 or 4).",
+                flush=True,
+            )
+        args.microbatch_size = args.minibatch_size
 
     set_seed(args.seed + rank)
 
