@@ -26,7 +26,7 @@ import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -45,6 +45,11 @@ from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 from prismatic.models.action_heads import L1RegressionActionHead
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,12 +195,6 @@ def parse_args() -> argparse.Namespace:
     # PPO
     ap.add_argument("--total_updates", type=int, default=3000)
     ap.add_argument("--rollout_steps", type=int, default=256)
-    ap.add_argument(
-        "--rollout_log_every",
-        type=int,
-        default=16,
-        help="Print rollout collection heartbeat every N env steps (0 disables).",
-    )
     ap.add_argument("--ppo_epochs", type=int, default=4)
     ap.add_argument("--minibatch_size", type=int, default=4)
     ap.add_argument(
@@ -243,10 +242,22 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--save_every", type=int, default=100)
     ap.add_argument(
-        "--train_log_every",
-        type=int,
-        default=20,
-        help="Print PPO optimization heartbeat every N minibatches (0 disables).",
+        "--status_bar",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show tqdm progress bars for updates/rollout/train (rank 0 only).",
+    )
+    ap.add_argument(
+        "--quiet_env_logs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Suppress simulator/wrapper stdout/stderr during env init/reset/close.",
+    )
+    ap.add_argument(
+        "--env_trace_path",
+        type=str,
+        default=None,
+        help="Optional JSONL file to log scene/object/instruction/success per completed episode (rank 0).",
     )
     ap.add_argument("--run_root_dir", type=str, default="runs_ppo")
     ap.add_argument("--run_id", type=str, default=None)
@@ -290,6 +301,27 @@ def _unwrap_module(module: nn.Module) -> nn.Module:
     if isinstance(module, DDP):
         return module.module
     return module
+
+
+@contextmanager
+def _silence_stdio(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        os.close(devnull_fd)
 
 
 def make_run_dir(args: argparse.Namespace) -> Path:
@@ -872,7 +904,7 @@ class OpenVLAPPOPolicy(nn.Module):
             past_key_values=None,
             inputs_embeds=multimodal_embeddings,
             labels=None,
-            use_cache=None,
+            use_cache=False,
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
@@ -1240,45 +1272,66 @@ def main() -> None:
     param_groups.append({"params": value_params, "lr": args.value_lr})
     param_groups.append({"params": [policy_core.log_std], "lr": args.value_lr})
     optimizer = AdamW(param_groups)
+    use_tqdm = bool(args.status_bar and is_main and (tqdm is not None))
+    if is_main and args.status_bar and tqdm is None:
+        print("[WARN] tqdm is unavailable; falling back to periodic summary prints.", flush=True)
 
-    env = CDPRVisionLanguageEnv(
-        cdpr_dataset_root=Path(args.cdpr_dataset_root),
-        cdpr_mujoco_root=args.cdpr_mujoco_root,
-        catalog_path=args.catalog_path,
-        max_steps=args.max_env_steps,
-        action_step_xyz=args.action_step_xyz,
-        action_step_yaw=args.action_step_yaw,
-        capture_frames=args.capture_frames,
-        instruction_types=args.instruction_types,
-        desk_textures_dir=args.desk_textures_dir,
-        allowed_objects=args.allowed_objects,
-        desk_geom_regex=args.desk_geom_regex,
-        desk_texrepeat=args.desk_texrepeat,
-        wrapper_cleanup=args.wrapper_cleanup,
-        use_wrapper_cache=args.use_wrapper_cache,
-        invert_x_action=args.invert_x_action,
-        invert_y_action=args.invert_y_action,
-        seed=args.seed + rank,
-    )
-
+    env: Optional[CDPRVisionLanguageEnv] = None
+    updates_pbar = None
+    trace_fp = None
     global_step = 0
+    episode_idx = 0
+
+    if is_main and args.env_trace_path:
+        trace_path = Path(args.env_trace_path).expanduser().resolve()
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_fp = trace_path.open("a", encoding="utf-8")
+
     try:
-        obs = env.reset()
+        with _silence_stdio(bool(args.quiet_env_logs)):
+            env = CDPRVisionLanguageEnv(
+                cdpr_dataset_root=Path(args.cdpr_dataset_root),
+                cdpr_mujoco_root=args.cdpr_mujoco_root,
+                catalog_path=args.catalog_path,
+                max_steps=args.max_env_steps,
+                action_step_xyz=args.action_step_xyz,
+                action_step_yaw=args.action_step_yaw,
+                capture_frames=args.capture_frames,
+                instruction_types=args.instruction_types,
+                desk_textures_dir=args.desk_textures_dir,
+                allowed_objects=args.allowed_objects,
+                desk_geom_regex=args.desk_geom_regex,
+                desk_texrepeat=args.desk_texrepeat,
+                wrapper_cleanup=args.wrapper_cleanup,
+                use_wrapper_cache=args.use_wrapper_cache,
+                invert_x_action=args.invert_x_action,
+                invert_y_action=args.invert_y_action,
+                seed=args.seed + rank,
+            )
+
+        with _silence_stdio(bool(args.quiet_env_logs)):
+            obs = env.reset()
+
+        if use_tqdm:
+            updates_pbar = tqdm(total=args.total_updates, desc="updates", dynamic_ncols=True, leave=True)
 
         for update in range(1, args.total_updates + 1):
             policy.eval()
             transitions: List[Transition] = []
             episode_returns = []
             ep_ret = 0.0
-            update_t0 = time.time()
-            rollout_t0 = time.time()
-            if is_main:
-                print(
-                    f"[update {update:05d}] collecting rollout ({args.rollout_steps} steps)...",
-                    flush=True,
-                )
 
-            for rollout_i in range(args.rollout_steps):
+            rollout_pbar = (
+                tqdm(
+                    total=args.rollout_steps,
+                    desc=f"u{update:05d} rollout",
+                    dynamic_ncols=True,
+                    leave=False,
+                )
+                if use_tqdm
+                else None
+            )
+            for _ in range(args.rollout_steps):
                 with torch.no_grad():
                     mean_action, std_action, value = policy(
                         images_primary=[obs["image_primary"]],
@@ -1290,7 +1343,7 @@ def main() -> None:
                     logprob_t = gaussian_log_prob(action_t, mean_action, std_action).sum(dim=-1)
 
                 action_np = action_t[0].cpu().numpy().astype(np.float32)
-                next_obs, reward, done, _ = env.step(action_np)
+                next_obs, reward, done, step_info = env.step(action_np)
 
                 transitions.append(
                     Transition(
@@ -1312,19 +1365,33 @@ def main() -> None:
                 if done:
                     episode_returns.append(ep_ret)
                     ep_ret = 0.0
-                    obs = env.reset()
+                    episode_idx += 1
 
-                if is_main and args.rollout_log_every > 0:
-                    done_rollout = (rollout_i + 1) >= args.rollout_steps
-                    if ((rollout_i + 1) % args.rollout_log_every == 0) or done_rollout:
-                        elapsed = time.time() - rollout_t0
-                        sps = (rollout_i + 1) / max(elapsed, 1e-6)
-                        print(
-                            f"[update {update:05d}][rollout] "
-                            f"{rollout_i + 1}/{args.rollout_steps} steps "
-                            f"({sps:.2f} env_steps/s)",
-                            flush=True,
-                        )
+                    if trace_fp is not None:
+                        event = {
+                            "update": int(update),
+                            "episode": int(episode_idx),
+                            "global_step": int(global_step),
+                            "scene": str(step_info.get("scene", "")),
+                            "target_object_catalog": str(step_info.get("target_object_catalog", "")),
+                            "target_object_body": str(step_info.get("target_object_body", "")),
+                            "instruction": str(step_info.get("language_instruction", "")),
+                            "instruction_type": str(step_info.get("instruction_type", "")),
+                            "success": bool(step_info.get("success", False)),
+                            "reward": float(step_info.get("reward", reward)),
+                            "desk_texture": str(step_info.get("desk_texture", "")),
+                        }
+                        trace_fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+                        trace_fp.flush()
+
+                    with _silence_stdio(bool(args.quiet_env_logs)):
+                        obs = env.reset()
+
+                if rollout_pbar is not None:
+                    rollout_pbar.update(1)
+
+            if rollout_pbar is not None:
+                rollout_pbar.close()
 
             with torch.no_grad():
                 _, _, next_value_t = policy(
@@ -1353,13 +1420,16 @@ def main() -> None:
             policy.train()
             idxs = np.arange(len(transitions))
             total_minibatches = args.ppo_epochs * max(1, math.ceil(len(idxs) / args.minibatch_size))
-            mb_done = 0
-            train_t0 = time.time()
-            if is_main:
-                print(
-                    f"[update {update:05d}] optimizing PPO ({total_minibatches} minibatches)...",
-                    flush=True,
+            train_pbar = (
+                tqdm(
+                    total=total_minibatches,
+                    desc=f"u{update:05d} train",
+                    dynamic_ncols=True,
+                    leave=False,
                 )
+                if use_tqdm
+                else None
+            )
             for _ in range(args.ppo_epochs):
                 np.random.shuffle(idxs)
                 for start in range(0, len(idxs), args.minibatch_size):
@@ -1369,10 +1439,6 @@ def main() -> None:
 
                     optimizer.zero_grad(set_to_none=True)
                     micro_splits = max(1, math.ceil(len(mb_idx) / args.microbatch_size))
-                    mb_loss_acc = 0.0
-                    mb_policy_loss_acc = 0.0
-                    mb_value_loss_acc = 0.0
-                    mb_entropy_acc = 0.0
 
                     for micro_start in range(0, len(mb_idx), args.microbatch_size):
                         micro_idx = mb_idx[micro_start : micro_start + args.microbatch_size]
@@ -1422,41 +1488,34 @@ def main() -> None:
                             value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
                             loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
-                            mb_loss_acc += float(loss.item())
-                            mb_policy_loss_acc += float(policy_loss.item())
-                            mb_value_loss_acc += float(value_loss.item())
-                            mb_entropy_acc += float(entropy.item())
                             (loss / micro_splits).backward()
 
                     nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
                     optimizer.step()
-                    mb_done += 1
+                    if train_pbar is not None:
+                        train_pbar.update(1)
 
-                    if is_main and args.train_log_every > 0:
-                        done_train = mb_done >= total_minibatches
-                        if (mb_done % args.train_log_every == 0) or done_train:
-                            print(
-                                f"[update {update:05d}][train] "
-                                f"{mb_done}/{total_minibatches} minibatches "
-                                f"loss={mb_loss_acc / micro_splits:.4f} "
-                                f"policy={mb_policy_loss_acc / micro_splits:.4f} "
-                                f"value={mb_value_loss_acc / micro_splits:.4f} "
-                                f"entropy={mb_entropy_acc / micro_splits:.4f} "
-                                f"elapsed={time.time() - train_t0:.1f}s",
-                                flush=True,
-                            )
+            if train_pbar is not None:
+                train_pbar.close()
 
             avg_rollout_reward = float(rewards.mean())
             avg_return = float(np.mean(episode_returns)) if episode_returns else ep_ret
 
-            if is_main:
+            if updates_pbar is not None:
+                updates_pbar.update(1)
+                updates_pbar.set_postfix(
+                    step=int(global_step),
+                    reward=f"{avg_rollout_reward:.3f}",
+                    ep_ret=f"{avg_return:.3f}",
+                    log_std=f"{float(policy_core.log_std.mean().item()):.3f}",
+                )
+            elif is_main:
                 print(
                     f"[update {update:05d}] "
                     f"global_step={global_step} "
                     f"rollout_reward_mean={avg_rollout_reward:.4f} "
                     f"episode_return_mean={avg_return:.4f} "
-                    f"log_std_mean={float(policy_core.log_std.mean().item()):.4f} "
-                    f"update_time={time.time() - update_t0:.1f}s",
+                    f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
                     flush=True,
                 )
 
@@ -1480,7 +1539,13 @@ def main() -> None:
                 log_std=policy_core.log_std,
             )
     finally:
-        env.close()
+        if updates_pbar is not None:
+            updates_pbar.close()
+        if trace_fp is not None:
+            trace_fp.close()
+        if env is not None:
+            with _silence_stdio(bool(args.quiet_env_logs)):
+                env.close()
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
 
