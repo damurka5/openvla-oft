@@ -224,7 +224,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--ddp_find_unused_parameters",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Enable DDP unused-parameter detection for safety with optional branches.",
     )
     ap.add_argument(
@@ -1124,14 +1124,14 @@ def main() -> None:
             flush=True,
         )
 
-    if world_size > 1 and args.gradient_checkpointing and args.ddp_find_unused_parameters:
+    if world_size > 1 and not args.ddp_find_unused_parameters:
         if is_main:
             print(
-                "[WARN] DDP + gradient checkpointing is unstable with find_unused_parameters=True. "
-                "Forcing --no-ddp_find_unused_parameters.",
+                "[WARN] Multi-GPU PPO may skip some trainable params on some iterations. "
+                "Forcing --ddp_find_unused_parameters for DDP stability.",
                 flush=True,
             )
-        args.ddp_find_unused_parameters = False
+        args.ddp_find_unused_parameters = True
 
     # NOTE: Some PyTorch versions hit reducer/internal asserts when combining
     # DDP + gradient checkpointing + multiple backward() calls per optimizer step.
