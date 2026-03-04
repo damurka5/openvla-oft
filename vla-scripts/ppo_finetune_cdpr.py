@@ -16,6 +16,7 @@ PPO is on-policy and requires environment interaction rollouts.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import random
@@ -449,7 +450,13 @@ def _strip_generated_texture_prefix(name: str) -> str:
     return out
 
 
-def _prepare_desk_textures_dir(src_dir: str, run_dir: Path, is_main: bool, rank: int) -> str:
+def _prepare_desk_textures_dir(
+    src_dir: str,
+    run_dir: Path,
+    is_main: bool,
+    rank: int,
+    max_textures: int,
+) -> str:
     src = Path(src_dir).expanduser().resolve()
     if not src.exists() or not src.is_dir():
         return str(src)
@@ -458,28 +465,30 @@ def _prepare_desk_textures_dir(src_dir: str, run_dir: Path, is_main: bool, rank:
     if not texture_files:
         return str(src)
 
-    base_candidates = [p for p in texture_files if (not p.name.startswith("rl_")) and ("__rl_" not in p.name)]
-    if len(base_candidates) == 0:
-        # Fallback: collapse generated chains by canonical tail name and pick shortest source name.
-        dedup: Dict[str, Path] = {}
-        for p in texture_files:
-            canonical_name = _strip_generated_texture_prefix(p.name)
-            cur = dedup.get(canonical_name)
-            if cur is None or len(p.name) < len(cur.name):
-                dedup[canonical_name] = p
-        base_candidates = sorted(dedup.values(), key=lambda x: x.name)
+    # Collapse generated chains by canonical tail name and pick shortest representative.
+    dedup: Dict[str, Path] = {}
+    for p in texture_files:
+        name = _strip_generated_texture_prefix(p.name)
+        canonical_name = name.split("__")[-1]
+        cur = dedup.get(canonical_name)
+        if cur is None or len(p.name) < len(cur.name):
+            dedup[canonical_name] = p
+    base_candidates = sorted(dedup.values(), key=lambda x: x.name)
+    if int(max_textures) > 0 and len(base_candidates) > int(max_textures):
+        base_candidates = base_candidates[: int(max_textures)]
 
-    # If we already look clean, keep original path.
-    if len(base_candidates) == len(texture_files) and all(p in texture_files for p in base_candidates):
+    # If already a small clean directory, keep original path.
+    if len(base_candidates) == len(texture_files) and len(texture_files) <= max(1, int(max_textures)):
         return str(src)
 
     cleaned_dir = run_dir / "desk_textures_clean"
     cleaned_dir.mkdir(parents=True, exist_ok=True)
 
     kept = 0
-    for p in base_candidates:
-        canonical_name = _strip_generated_texture_prefix(p.name)
-        dst = cleaned_dir / canonical_name
+    for idx, p in enumerate(base_candidates):
+        ext = p.suffix.lower() if p.suffix else ".png"
+        short_hash = hashlib.sha1(p.name.encode("utf-8")).hexdigest()[:8]
+        dst = cleaned_dir / f"tex_{idx:03d}_{short_hash}{ext}"
         if dst.exists():
             continue
         try:
@@ -491,7 +500,7 @@ def _prepare_desk_textures_dir(src_dir: str, run_dir: Path, is_main: bool, rank:
     if is_main:
         print(
             f"[env] Sanitized desk textures dir: {src} -> {cleaned_dir} "
-            f"(kept {kept}/{len(texture_files)} files; dropped generated variants).",
+            f"(kept {kept}/{len(texture_files)} files; dropped generated variants and shortened names).",
             flush=True,
         )
         if "_desk_textures" in str(src):
@@ -1330,6 +1339,42 @@ class CDPRVisionLanguageEnv:
     def _safe_cache_tag(text: str) -> str:
         return re.sub(r"[^a-zA-Z0-9_\\-]+", "_", str(text))[:96]
 
+    def _activate_scene_wrapper_cache(
+        self,
+        scene_wrapper_cache: Dict[str, List[Path]],
+        texture_name_by_wrapper: Dict[str, str],
+    ) -> Dict[str, int]:
+        rl = self.env
+        cache = {str(k): [Path(p).resolve() for p in v] for k, v in scene_wrapper_cache.items() if v}
+        texture_map = {str(Path(k).resolve()): str(v) for k, v in texture_name_by_wrapper.items()}
+        if not cache:
+            return {"scenes": 0, "variants": 0, "textures": 0}
+
+        cached_scene_names = set(cache.keys())
+        rl.scenes = [s for s in list(getattr(rl, "scenes", []) or []) if str(getattr(s, "name", "")) in cached_scene_names]
+        self._scene_wrapper_cache = cache
+        self._texture_name_by_wrapper = texture_map
+
+        def _build_wrapper_cached(this, scene):
+            scene_name = str(getattr(scene, "name", ""))
+            variants_local = self._scene_wrapper_cache.get(scene_name)
+            if variants_local:
+                idx = int(this.np_random.integers(0, len(variants_local)))
+                chosen = Path(variants_local[idx]).resolve()
+                this._desk_texture_name = self._texture_name_by_wrapper.get(str(chosen), "")
+                return chosen
+            return this._build_wrapper_original(scene)
+
+        if not hasattr(rl, "_build_wrapper_original"):
+            rl._build_wrapper_original = rl._build_wrapper
+        rl._build_wrapper = types.MethodType(_build_wrapper_cached, rl)
+        rl.wrapper_cleanup = False
+        rl.use_wrapper_cache = True
+
+        variants_total = sum(len(v) for v in cache.values())
+        unique_textures = len({v for v in texture_map.values() if v})
+        return {"scenes": len(cache), "variants": variants_total, "textures": unique_textures}
+
     def enable_prebuilt_scene_cache(
         self,
         scene_pool_size: int,
@@ -1364,7 +1409,7 @@ class CDPRVisionLanguageEnv:
         texture_name_by_wrapper: Dict[str, str] = {}
         total_variants = 0
 
-        for scene in scenes:
+        for s_idx, scene in enumerate(scenes):
             scene_name = str(getattr(scene, "name", ""))
             scene_objects = list(getattr(scene, "objects", []))
             if not scene_name or not scene_objects:
@@ -1387,7 +1432,8 @@ class CDPRVisionLanguageEnv:
             if texture_files:
                 for tex_idx_local, tex in enumerate(texture_files):
                     tex_path = Path(tex).resolve()
-                    tag = self._safe_cache_tag(f"cache_{scene_name}_{tex_idx_local}_{tex_path.stem}")
+                    tex_hash = hashlib.sha1(tex_path.name.encode("utf-8")).hexdigest()[:8]
+                    tag = self._safe_cache_tag(f"c{s_idx:02d}_t{tex_idx_local:03d}_{tex_hash}")
                     patched = rl_mod._build_textured_wrapper_variant(
                         base_wrapper_xml=base_wrapper,
                         chosen_texture=tex_path,
@@ -1407,35 +1453,19 @@ class CDPRVisionLanguageEnv:
                 total_variants += len(variants)
 
         if not cache:
-            return {"scenes": 0, "variants": 0, "textures": len(texture_files)}
+            return {"scenes": 0, "variants": 0, "textures": 0}
 
-        # Restrict env sampling to cached scenes and force wrapper reuse.
-        cached_scene_names = set(cache.keys())
-        rl.scenes = [s for s in scenes if str(getattr(s, "name", "")) in cached_scene_names]
-        self._scene_wrapper_cache = cache
-        self._texture_name_by_wrapper = texture_name_by_wrapper
+        out = self._activate_scene_wrapper_cache(cache, texture_name_by_wrapper)
+        # Keep this as explicit prebuild count for logs.
+        out["variants"] = total_variants
+        return out
 
-        def _build_wrapper_cached(this, scene):
-            scene_name = str(getattr(scene, "name", ""))
-            variants_local = self._scene_wrapper_cache.get(scene_name)
-            if variants_local:
-                idx = int(this.np_random.integers(0, len(variants_local)))
-                chosen = Path(variants_local[idx]).resolve()
-                this._desk_texture_name = self._texture_name_by_wrapper.get(str(chosen), "")
-                return chosen
-            return this._build_wrapper_original(scene)
-
-        if not hasattr(rl, "_build_wrapper_original"):
-            rl._build_wrapper_original = rl._build_wrapper
-        rl._build_wrapper = types.MethodType(_build_wrapper_cached, rl)
-        rl.wrapper_cleanup = False
-        rl.use_wrapper_cache = True
-
-        return {
-            "scenes": len(cache),
-            "variants": total_variants,
-            "textures": len(texture_files),
-        }
+    def attach_prebuilt_scene_cache(
+        self,
+        scene_wrapper_cache: Dict[str, List[Path]],
+        texture_name_by_wrapper: Dict[str, str],
+    ) -> Dict[str, int]:
+        return self._activate_scene_wrapper_cache(scene_wrapper_cache, texture_name_by_wrapper)
 
     def step(self, action: np.ndarray):
         action_env = np.asarray(action, dtype=np.float32).copy()
@@ -1918,6 +1948,7 @@ def main() -> None:
         run_dir=run_dir,
         is_main=is_main,
         rank=rank,
+        max_textures=args.texture_pool_size if args.texture_pool_size > 0 else 128,
     )
 
     vla, processor = load_vla_and_processor(args, device)
@@ -2084,10 +2115,9 @@ def main() -> None:
                     seed=args.seed + 50_000,
                 )
             if args.prebuild_scene_cache:
-                val_cache_info = val_env.enable_prebuilt_scene_cache(
-                    scene_pool_size=args.scene_pool_size,
-                    texture_pool_size=args.texture_pool_size,
-                    seed=args.seed + 70_000,
+                val_cache_info = val_env.attach_prebuilt_scene_cache(
+                    scene_wrapper_cache=env._scene_wrapper_cache,
+                    texture_name_by_wrapper=env._texture_name_by_wrapper,
                 )
                 print(
                     f"[env_cache] val scenes={val_cache_info['scenes']} "
