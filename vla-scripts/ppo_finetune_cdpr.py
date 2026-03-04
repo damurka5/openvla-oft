@@ -16,6 +16,7 @@ PPO is on-policy and requires environment interaction rollouts.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 import sys
@@ -27,10 +28,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from torch.distributions import Normal
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
@@ -187,7 +190,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--total_updates", type=int, default=3000)
     ap.add_argument("--rollout_steps", type=int, default=256)
     ap.add_argument("--ppo_epochs", type=int, default=4)
-    ap.add_argument("--minibatch_size", type=int, default=32)
+    ap.add_argument("--minibatch_size", type=int, default=8)
+    ap.add_argument(
+        "--microbatch_size",
+        type=int,
+        default=4,
+        help=(
+            "Split each PPO minibatch into smaller forward/backward chunks to lower peak GPU memory. "
+            "Effective optimizer batch remains --minibatch_size."
+        ),
+    )
     ap.add_argument("--gamma", type=float, default=0.99)
     ap.add_argument("--gae_lambda", type=float, default=0.95)
     ap.add_argument("--clip_coef", type=float, default=0.2)
@@ -201,6 +213,18 @@ def parse_args() -> argparse.Namespace:
     # Runtime
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument(
+        "--gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable gradient checkpointing on VLA to reduce activation memory.",
+    )
+    ap.add_argument(
+        "--ddp_find_unused_parameters",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable DDP unused-parameter detection for safety with optional branches.",
+    )
     ap.add_argument("--save_every", type=int, default=100)
     ap.add_argument("--run_root_dir", type=str, default="runs_ppo")
     ap.add_argument("--run_id", type=str, default=None)
@@ -215,6 +239,35 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _init_distributed() -> Tuple[int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if world_size > 1 and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+    return rank, local_rank, world_size
+
+
+def _is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def _broadcast_object(obj: Any, rank: int) -> Any:
+    if not (dist.is_available() and dist.is_initialized()):
+        return obj
+    payload = [obj if rank == 0 else None]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
+def _unwrap_module(module: nn.Module) -> nn.Module:
+    if isinstance(module, DDP):
+        return module.module
+    return module
 
 
 def make_run_dir(args: argparse.Namespace) -> Path:
@@ -586,6 +639,23 @@ def load_vla_and_processor(args: argparse.Namespace, device: torch.device):
     return vla, processor
 
 
+def maybe_enable_gradient_checkpointing(vla: nn.Module, enabled: bool) -> None:
+    if not enabled:
+        return
+    try:
+        if hasattr(vla, "gradient_checkpointing_enable"):
+            vla.gradient_checkpointing_enable()
+        base_model = getattr(vla, "base_model", None)
+        if base_model is not None and hasattr(base_model, "gradient_checkpointing_enable"):
+            base_model.gradient_checkpointing_enable()
+        cfg = getattr(vla, "config", None)
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cfg.use_cache = False
+        print("[model] Enabled gradient checkpointing.", flush=True)
+    except Exception as exc:
+        print(f"[WARN] Could not enable gradient checkpointing: {exc}", flush=True)
+
+
 def build_action_head(
     args: argparse.Namespace, llm_dim: int, device: torch.device
 ) -> L1RegressionActionHead:
@@ -657,6 +727,18 @@ class OpenVLAPPOPolicy(nn.Module):
                 dtype=torch.float32,
                 device=self.device,
             )
+        )
+
+    def forward(
+        self,
+        images_primary: List[np.ndarray],
+        instructions: List[str],
+        images_wrist: Optional[List[np.ndarray]] = None,
+    ):
+        return self.distribution_and_value(
+            images_primary=images_primary,
+            instructions=instructions,
+            images_wrist=images_wrist,
         )
 
     def _core_model(self):
@@ -973,24 +1055,68 @@ def main() -> None:
         raise ValueError(
             "Vision-language PPO requires rendered images; please run with --capture_frames (default: enabled)."
         )
-    set_seed(args.seed)
+    if args.minibatch_size < 1:
+        raise ValueError("--minibatch_size must be >= 1.")
+    if args.microbatch_size < 1:
+        raise ValueError("--microbatch_size must be >= 1.")
+    if args.microbatch_size > args.minibatch_size:
+        print(
+            f"[WARN] --microbatch_size ({args.microbatch_size}) > --minibatch_size ({args.minibatch_size}); "
+            "clamping microbatch_size to minibatch_size.",
+            flush=True,
+        )
+        args.microbatch_size = args.minibatch_size
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    run_dir = make_run_dir(args)
-    save_run_config(args, run_dir)
-    print(f"Run dir: {run_dir}", flush=True)
+    rank, local_rank, world_size = _init_distributed()
+    is_main = _is_main_process(rank)
+
+    if torch.cuda.is_available():
+        if world_size > 1:
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            parsed_device = torch.device(args.device)
+            if parsed_device.type == "cuda" and parsed_device.index is None:
+                parsed_device = torch.device("cuda:0")
+            device = parsed_device
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+
+    if is_main and torch.cuda.is_available() and world_size == 1 and torch.cuda.device_count() > 1:
+        print(
+            f"[INFO] Detected {torch.cuda.device_count()} GPUs. "
+            "Use `torchrun --nproc_per_node=<num_gpus> ... ppo_finetune_cdpr.py` to train with DDP on all GPUs.",
+            flush=True,
+        )
+
+    if is_main and args.use_wrapper_cache and args.wrapper_cleanup:
+        print(
+            "[WARN] `--use_wrapper_cache` is effectively disabled when `--wrapper_cleanup` is true in CDPR env reset logic. "
+            "Use `--no-wrapper_cleanup` to keep cache active across episodes.",
+            flush=True,
+        )
+
+    set_seed(args.seed + rank)
+
+    run_dir_local: Optional[Path] = None
+    if is_main:
+        run_dir_local = make_run_dir(args)
+        save_run_config(args, run_dir_local)
+        print(f"Run dir: {run_dir_local}", flush=True)
+    run_dir = Path(_broadcast_object(str(run_dir_local) if run_dir_local is not None else None, rank))
 
     vla, processor = load_vla_and_processor(args, device)
+    maybe_enable_gradient_checkpointing(vla, enabled=bool(args.gradient_checkpointing))
 
     llm_dim = _resolve_llm_dim(vla)
     if llm_dim is None:
         raise RuntimeError("Could not resolve llm_dim from OpenVLA model wrapper.")
 
     action_head = build_action_head(args=args, llm_dim=llm_dim, device=device)
-
     value_head = PPOValueHead(llm_dim=llm_dim).to(device)
 
-    policy = OpenVLAPPOPolicy(
+    policy: nn.Module = OpenVLAPPOPolicy(
         vla=vla,
         processor=processor,
         action_head=action_head,
@@ -999,26 +1125,38 @@ def main() -> None:
         num_images_in_input=args.num_images_in_input,
         init_log_std=args.init_log_std,
     )
+    if world_size > 1:
+        if device.type != "cuda":
+            raise RuntimeError("DDP multi-process PPO currently requires CUDA devices.")
+        policy = DDP(
+            policy,
+            device_ids=[device.index],
+            find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            gradient_as_bucket_view=True,
+        )
 
-    lora_params = [p for p in vla.parameters() if p.requires_grad]
-    action_params = list(action_head.parameters())
-    value_params = list(value_head.parameters())
-    trainable_params = lora_params + action_params + value_params + [policy.log_std]
+    policy_core = _unwrap_module(policy)
+    lora_params = [p for p in policy_core.vla.parameters() if p.requires_grad]
+    action_params = list(policy_core.action_head.parameters())
+    value_params = list(policy_core.value_head.parameters())
+    trainable_params = lora_params + action_params + value_params + [policy_core.log_std]
 
-    print(
-        "[trainable] "
-        f"lora={sum(p.numel() for p in lora_params)} "
-        f"action_head={sum(p.numel() for p in action_params)} "
-        f"value_head={sum(p.numel() for p in value_params)}",
-        flush=True,
-    )
+    if is_main:
+        print(
+            "[trainable] "
+            f"lora={sum(p.numel() for p in lora_params)} "
+            f"action_head={sum(p.numel() for p in action_params)} "
+            f"value_head={sum(p.numel() for p in value_params)} "
+            f"world_size={world_size}",
+            flush=True,
+        )
 
     param_groups = []
     if lora_params:
         param_groups.append({"params": lora_params, "lr": args.learning_rate})
     param_groups.append({"params": action_params, "lr": args.learning_rate})
     param_groups.append({"params": value_params, "lr": args.value_lr})
-    param_groups.append({"params": [policy.log_std], "lr": args.value_lr})
+    param_groups.append({"params": [policy_core.log_std], "lr": args.value_lr})
     optimizer = AdamW(param_groups)
 
     env = CDPRVisionLanguageEnv(
@@ -1038,159 +1176,173 @@ def main() -> None:
         use_wrapper_cache=args.use_wrapper_cache,
         invert_x_action=args.invert_x_action,
         invert_y_action=args.invert_y_action,
-        seed=args.seed,
+        seed=args.seed + rank,
     )
 
-    obs = env.reset()
     global_step = 0
+    try:
+        obs = env.reset()
 
-    for update in range(1, args.total_updates + 1):
-        policy.eval()
-        transitions: List[Transition] = []
-        episode_returns = []
-        ep_ret = 0.0
+        for update in range(1, args.total_updates + 1):
+            policy.eval()
+            transitions: List[Transition] = []
+            episode_returns = []
+            ep_ret = 0.0
 
-        for _ in range(args.rollout_steps):
+            for _ in range(args.rollout_steps):
+                with torch.no_grad():
+                    policy_dist, value = policy(
+                        images_primary=[obs["image_primary"]],
+                        images_wrist=[obs["image_wrist"]] if args.num_images_in_input > 1 else None,
+                        instructions=[obs["instruction"]],
+                    )
+                    action_t = policy_dist.sample()
+                    action_t = torch.clamp(action_t, -1.0, 1.0)
+                    logprob_t = policy_dist.log_prob(action_t).sum(dim=-1)
+
+                action_np = action_t[0].cpu().numpy().astype(np.float32)
+                next_obs, reward, done, _ = env.step(action_np)
+
+                transitions.append(
+                    Transition(
+                        img_primary=obs["image_primary"],
+                        img_wrist=obs["image_wrist"] if args.num_images_in_input > 1 else None,
+                        instruction=obs["instruction"],
+                        action=action_np,
+                        logprob=float(logprob_t.item()),
+                        reward=float(reward),
+                        done=float(done),
+                        value=float(value.item()),
+                    )
+                )
+
+                ep_ret += float(reward)
+                global_step += 1
+                obs = next_obs
+
+                if done:
+                    episode_returns.append(ep_ret)
+                    ep_ret = 0.0
+                    obs = env.reset()
+
             with torch.no_grad():
-                dist, value = policy.distribution_and_value(
+                _, next_value_t = policy(
                     images_primary=[obs["image_primary"]],
                     images_wrist=[obs["image_wrist"]] if args.num_images_in_input > 1 else None,
                     instructions=[obs["instruction"]],
                 )
-                action_t = dist.sample()
-                action_t = torch.clamp(action_t, -1.0, 1.0)
-                logprob_t = dist.log_prob(action_t).sum(dim=-1)
+                next_value = float(next_value_t.item())
 
-            action_np = action_t[0].cpu().numpy().astype(np.float32)
-            next_obs, reward, done, _ = env.step(action_np)
+            rewards = np.array([t.reward for t in transitions], dtype=np.float32)
+            dones = np.array([t.done for t in transitions], dtype=np.float32)
+            values = np.array([t.value for t in transitions], dtype=np.float32)
+            actions = np.stack([t.action for t in transitions], axis=0)
+            old_logprobs = np.array([t.logprob for t in transitions], dtype=np.float32)
 
-            transitions.append(
-                Transition(
-                    img_primary=obs["image_primary"],
-                    img_wrist=obs["image_wrist"] if args.num_images_in_input > 1 else None,
-                    instruction=obs["instruction"],
-                    action=action_np,
-                    logprob=float(logprob_t.item()),
-                    reward=float(reward),
-                    done=float(done),
-                    value=float(value.item()),
-                )
+            advantages, returns = compute_gae(
+                rewards=rewards,
+                dones=dones,
+                values=values,
+                next_value=next_value,
+                gamma=args.gamma,
+                gae_lambda=args.gae_lambda,
             )
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            ep_ret += float(reward)
-            global_step += 1
-            obs = next_obs
+            policy.train()
+            idxs = np.arange(len(transitions))
+            for _ in range(args.ppo_epochs):
+                np.random.shuffle(idxs)
+                for start in range(0, len(idxs), args.minibatch_size):
+                    mb_idx = idxs[start : start + args.minibatch_size]
+                    if len(mb_idx) == 0:
+                        continue
 
-            if done:
-                episode_returns.append(ep_ret)
-                ep_ret = 0.0
-                obs = env.reset()
+                    optimizer.zero_grad(set_to_none=True)
+                    micro_splits = max(1, math.ceil(len(mb_idx) / args.microbatch_size))
 
-        with torch.no_grad():
-            _, next_value_t = policy.distribution_and_value(
-                images_primary=[obs["image_primary"]],
-                images_wrist=[obs["image_wrist"]] if args.num_images_in_input > 1 else None,
-                instructions=[obs["instruction"]],
-            )
-            next_value = float(next_value_t.item())
+                    for micro_start in range(0, len(mb_idx), args.microbatch_size):
+                        micro_idx = mb_idx[micro_start : micro_start + args.microbatch_size]
+                        if len(micro_idx) == 0:
+                            continue
 
-        rewards = np.array([t.reward for t in transitions], dtype=np.float32)
-        dones = np.array([t.done for t in transitions], dtype=np.float32)
-        values = np.array([t.value for t in transitions], dtype=np.float32)
-        actions = np.stack([t.action for t in transitions], axis=0)
-        old_logprobs = np.array([t.logprob for t in transitions], dtype=np.float32)
+                        mb_imgs_primary = [transitions[i].img_primary for i in micro_idx]
+                        mb_imgs_wrist = (
+                            [transitions[i].img_wrist for i in micro_idx] if args.num_images_in_input > 1 else None
+                        )
+                        mb_instr = [transitions[i].instruction for i in micro_idx]
 
-        advantages, returns = compute_gae(
-            rewards=rewards,
-            dones=dones,
-            values=values,
-            next_value=next_value,
-            gamma=args.gamma,
-            gae_lambda=args.gae_lambda,
-        )
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                        policy_dist, value_pred = policy(
+                            images_primary=mb_imgs_primary,
+                            images_wrist=mb_imgs_wrist,
+                            instructions=mb_instr,
+                        )
 
-        policy.train()
-        idxs = np.arange(len(transitions))
-        for _ in range(args.ppo_epochs):
-            np.random.shuffle(idxs)
-            for start in range(0, len(idxs), args.minibatch_size):
-                mb_idx = idxs[start : start + args.minibatch_size]
-                if len(mb_idx) == 0:
-                    continue
+                        mb_actions = torch.tensor(actions[micro_idx], dtype=torch.float32, device=device)
+                        mb_old_logprobs = torch.tensor(old_logprobs[micro_idx], dtype=torch.float32, device=device)
+                        mb_adv = torch.tensor(advantages[micro_idx], dtype=torch.float32, device=device)
+                        mb_ret = torch.tensor(returns[micro_idx], dtype=torch.float32, device=device)
+                        mb_old_values = torch.tensor(values[micro_idx], dtype=torch.float32, device=device)
 
-                mb_imgs_primary = [transitions[i].img_primary for i in mb_idx]
-                mb_imgs_wrist = [transitions[i].img_wrist for i in mb_idx] if args.num_images_in_input > 1 else None
-                mb_instr = [transitions[i].instruction for i in mb_idx]
+                        new_logprob = policy_dist.log_prob(mb_actions).sum(dim=-1)
+                        entropy = policy_dist.entropy().sum(dim=-1).mean()
+                        ratio = (new_logprob - mb_old_logprobs).exp()
 
-                dist, value_pred = policy.distribution_and_value(
-                    images_primary=mb_imgs_primary,
-                    images_wrist=mb_imgs_wrist,
-                    instructions=mb_instr,
+                        pg_loss1 = -mb_adv * ratio
+                        pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+                        policy_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                        value_pred_clipped = mb_old_values + torch.clamp(
+                            value_pred - mb_old_values,
+                            -args.clip_coef,
+                            args.clip_coef,
+                        )
+                        v_loss_unclipped = (value_pred - mb_ret) ** 2
+                        v_loss_clipped = (value_pred_clipped - mb_ret) ** 2
+                        value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+                        loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
+                        (loss / micro_splits).backward()
+
+                    nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                    optimizer.step()
+
+            avg_rollout_reward = float(rewards.mean())
+            avg_return = float(np.mean(episode_returns)) if episode_returns else ep_ret
+
+            if is_main:
+                print(
+                    f"[update {update:05d}] "
+                    f"global_step={global_step} "
+                    f"rollout_reward_mean={avg_rollout_reward:.4f} "
+                    f"episode_return_mean={avg_return:.4f} "
+                    f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
+                    flush=True,
                 )
 
-                mb_actions = torch.tensor(actions[mb_idx], dtype=torch.float32, device=device)
-                mb_old_logprobs = torch.tensor(old_logprobs[mb_idx], dtype=torch.float32, device=device)
-                mb_adv = torch.tensor(advantages[mb_idx], dtype=torch.float32, device=device)
-                mb_ret = torch.tensor(returns[mb_idx], dtype=torch.float32, device=device)
-                mb_old_values = torch.tensor(values[mb_idx], dtype=torch.float32, device=device)
-
-                new_logprob = dist.log_prob(mb_actions).sum(dim=-1)
-                entropy = dist.entropy().sum(dim=-1).mean()
-                ratio = (new_logprob - mb_old_logprobs).exp()
-
-                pg_loss1 = -mb_adv * ratio
-                pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
-                policy_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                value_pred_clipped = mb_old_values + torch.clamp(
-                    value_pred - mb_old_values,
-                    -args.clip_coef,
-                    args.clip_coef,
+            if is_main and update % args.save_every == 0:
+                save_checkpoint(
+                    run_dir=run_dir,
+                    step=global_step,
+                    vla=policy_core.vla,
+                    action_head=policy_core.action_head,
+                    value_head=policy_core.value_head,
+                    log_std=policy_core.log_std,
                 )
-                v_loss_unclipped = (value_pred - mb_ret) ** 2
-                v_loss_clipped = (value_pred_clipped - mb_ret) ** 2
-                value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
-                loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
-
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
-                optimizer.step()
-
-        avg_rollout_reward = float(rewards.mean())
-        avg_return = float(np.mean(episode_returns)) if episode_returns else ep_ret
-
-        print(
-            f"[update {update:05d}] "
-            f"global_step={global_step} "
-            f"rollout_reward_mean={avg_rollout_reward:.4f} "
-            f"episode_return_mean={avg_return:.4f} "
-            f"log_std_mean={float(policy.log_std.mean().item()):.4f}",
-            flush=True,
-        )
-
-        if update % args.save_every == 0:
+        if is_main:
             save_checkpoint(
                 run_dir=run_dir,
                 step=global_step,
-                vla=vla,
-                action_head=action_head,
-                value_head=value_head,
-                log_std=policy.log_std,
+                vla=policy_core.vla,
+                action_head=policy_core.action_head,
+                value_head=policy_core.value_head,
+                log_std=policy_core.log_std,
             )
-
-    save_checkpoint(
-        run_dir=run_dir,
-        step=global_step,
-        vla=vla,
-        action_head=action_head,
-        value_head=value_head,
-        log_std=policy.log_std,
-    )
-
-    env.close()
+    finally:
+        env.close()
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
