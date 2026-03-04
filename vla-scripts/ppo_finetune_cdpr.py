@@ -34,7 +34,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
-from torch.distributions import Normal
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from huggingface_hub import snapshot_download
@@ -883,7 +882,7 @@ class OpenVLAPPOPolicy(nn.Module):
         images_primary: List[np.ndarray],
         instructions: List[str],
         images_wrist: Optional[List[np.ndarray]] = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         input_ids, attention_mask, pixel_values = self._prepare_inputs(images_primary, images_wrist, instructions)
 
         action_hidden_states = self._extract_action_hidden_states(
@@ -902,11 +901,11 @@ class OpenVLAPPOPolicy(nn.Module):
             .expand_as(mean_action)
             .to(device=mean_action.device, dtype=torch.float32)
         )
-        dist = Normal(mean_action, std)
+        std = torch.clamp(std, min=1e-6)
 
         current_action_hidden = action_hidden_states[:, :ACTION_DIM, :]
         value = self.value_head(current_action_hidden)
-        return dist, value
+        return mean_action, std, value
 
 
 @dataclass
@@ -1053,6 +1052,20 @@ def compute_gae(
         advantages[t] = last_gae
     returns = advantages + values
     return advantages, returns
+
+
+def gaussian_sample(mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    return mean + torch.randn_like(mean) * std
+
+
+def gaussian_log_prob(action: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    var = std * std
+    log_scale = torch.log(std)
+    return -0.5 * (((action - mean) ** 2) / var + 2.0 * log_scale + math.log(2.0 * math.pi))
+
+
+def gaussian_entropy(std: torch.Tensor) -> torch.Tensor:
+    return 0.5 + 0.5 * math.log(2.0 * math.pi) + torch.log(std)
 
 
 def save_checkpoint(
@@ -1248,14 +1261,14 @@ def main() -> None:
 
             for _ in range(args.rollout_steps):
                 with torch.no_grad():
-                    policy_dist, value = policy(
+                    mean_action, std_action, value = policy(
                         images_primary=[obs["image_primary"]],
                         images_wrist=[obs["image_wrist"]] if args.num_images_in_input > 1 else None,
                         instructions=[obs["instruction"]],
                     )
-                    action_t = policy_dist.sample()
+                    action_t = gaussian_sample(mean_action, std_action)
                     action_t = torch.clamp(action_t, -1.0, 1.0)
-                    logprob_t = policy_dist.log_prob(action_t).sum(dim=-1)
+                    logprob_t = gaussian_log_prob(action_t, mean_action, std_action).sum(dim=-1)
 
                 action_np = action_t[0].cpu().numpy().astype(np.float32)
                 next_obs, reward, done, _ = env.step(action_np)
@@ -1283,7 +1296,7 @@ def main() -> None:
                     obs = env.reset()
 
             with torch.no_grad():
-                _, next_value_t = policy(
+                _, _, next_value_t = policy(
                     images_primary=[obs["image_primary"]],
                     images_wrist=[obs["image_wrist"]] if args.num_images_in_input > 1 else None,
                     instructions=[obs["instruction"]],
@@ -1336,7 +1349,7 @@ def main() -> None:
                             )
                             mb_instr = [transitions[i].instruction for i in micro_idx]
 
-                            policy_dist, value_pred = policy(
+                            mean_action, std_action, value_pred = policy(
                                 images_primary=mb_imgs_primary,
                                 images_wrist=mb_imgs_wrist,
                                 instructions=mb_instr,
@@ -1348,8 +1361,8 @@ def main() -> None:
                             mb_ret = torch.tensor(returns[micro_idx], dtype=torch.float32, device=device)
                             mb_old_values = torch.tensor(values[micro_idx], dtype=torch.float32, device=device)
 
-                            new_logprob = policy_dist.log_prob(mb_actions).sum(dim=-1)
-                            entropy = policy_dist.entropy().sum(dim=-1).mean()
+                            new_logprob = gaussian_log_prob(mb_actions, mean_action, std_action).sum(dim=-1)
+                            entropy = gaussian_entropy(std_action).sum(dim=-1).mean()
                             ratio = (new_logprob - mb_old_logprobs).exp()
 
                             pg_loss1 = -mb_adv * ratio
