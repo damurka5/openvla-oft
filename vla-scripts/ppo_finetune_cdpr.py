@@ -22,9 +22,11 @@ import random
 import sys
 import time
 import json
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -222,8 +224,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--ddp_find_unused_parameters",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable DDP unused-parameter detection for safety with optional branches.",
+    )
+    ap.add_argument(
+        "--ddp_static_graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use DDP static-graph mode when available (recommended with gradient checkpointing). "
+            "Can avoid 'Expected to mark a variable ready only once' errors."
+        ),
     )
     ap.add_argument("--save_every", type=int, default=100)
     ap.add_argument("--run_root_dir", type=str, default="runs_ppo")
@@ -643,15 +654,31 @@ def maybe_enable_gradient_checkpointing(vla: nn.Module, enabled: bool) -> None:
     if not enabled:
         return
     try:
+        enabled_non_reentrant = False
         if hasattr(vla, "gradient_checkpointing_enable"):
-            vla.gradient_checkpointing_enable()
+            try:
+                vla.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                enabled_non_reentrant = True
+            except TypeError:
+                vla.gradient_checkpointing_enable()
         base_model = getattr(vla, "base_model", None)
         if base_model is not None and hasattr(base_model, "gradient_checkpointing_enable"):
-            base_model.gradient_checkpointing_enable()
+            try:
+                base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                enabled_non_reentrant = True
+            except TypeError:
+                base_model.gradient_checkpointing_enable()
         cfg = getattr(vla, "config", None)
         if cfg is not None and hasattr(cfg, "use_cache"):
             cfg.use_cache = False
-        print("[model] Enabled gradient checkpointing.", flush=True)
+        # Some wrappers keep their own config object.
+        base_cfg = getattr(base_model, "config", None)
+        if base_cfg is not None and hasattr(base_cfg, "use_cache"):
+            base_cfg.use_cache = False
+        msg = "[model] Enabled gradient checkpointing."
+        if enabled_non_reentrant:
+            msg += " (use_reentrant=False)"
+        print(msg, flush=True)
     except Exception as exc:
         print(f"[WARN] Could not enable gradient checkpointing: {exc}", flush=True)
 
@@ -1097,6 +1124,15 @@ def main() -> None:
             flush=True,
         )
 
+    if world_size > 1 and args.gradient_checkpointing and args.ddp_find_unused_parameters:
+        if is_main:
+            print(
+                "[WARN] DDP + gradient checkpointing is unstable with find_unused_parameters=True. "
+                "Forcing --no-ddp_find_unused_parameters.",
+                flush=True,
+            )
+        args.ddp_find_unused_parameters = False
+
     set_seed(args.seed + rank)
 
     run_dir_local: Optional[Path] = None
@@ -1128,12 +1164,20 @@ def main() -> None:
     if world_size > 1:
         if device.type != "cuda":
             raise RuntimeError("DDP multi-process PPO currently requires CUDA devices.")
-        policy = DDP(
-            policy,
+        ddp_kwargs = dict(
             device_ids=[device.index],
             find_unused_parameters=bool(args.ddp_find_unused_parameters),
             gradient_as_bucket_view=True,
         )
+        ddp_params = inspect.signature(DDP.__init__).parameters
+        if "static_graph" in ddp_params:
+            ddp_kwargs["static_graph"] = bool(args.ddp_static_graph)
+        policy = DDP(policy, **ddp_kwargs)
+        if args.ddp_static_graph and hasattr(policy, "_set_static_graph"):
+            try:
+                policy._set_static_graph()
+            except Exception:
+                pass
 
     policy_core = _unwrap_module(policy)
     lora_params = [p for p in policy_core.vla.parameters() if p.requires_grad]
@@ -1266,43 +1310,50 @@ def main() -> None:
                         if len(micro_idx) == 0:
                             continue
 
-                        mb_imgs_primary = [transitions[i].img_primary for i in micro_idx]
-                        mb_imgs_wrist = (
-                            [transitions[i].img_wrist for i in micro_idx] if args.num_images_in_input > 1 else None
+                        is_last_micro = (micro_start + args.microbatch_size) >= len(mb_idx)
+                        sync_ctx = (
+                            nullcontext()
+                            if (not isinstance(policy, DDP) or is_last_micro)
+                            else policy.no_sync()
                         )
-                        mb_instr = [transitions[i].instruction for i in micro_idx]
+                        with sync_ctx:
+                            mb_imgs_primary = [transitions[i].img_primary for i in micro_idx]
+                            mb_imgs_wrist = (
+                                [transitions[i].img_wrist for i in micro_idx] if args.num_images_in_input > 1 else None
+                            )
+                            mb_instr = [transitions[i].instruction for i in micro_idx]
 
-                        policy_dist, value_pred = policy(
-                            images_primary=mb_imgs_primary,
-                            images_wrist=mb_imgs_wrist,
-                            instructions=mb_instr,
-                        )
+                            policy_dist, value_pred = policy(
+                                images_primary=mb_imgs_primary,
+                                images_wrist=mb_imgs_wrist,
+                                instructions=mb_instr,
+                            )
 
-                        mb_actions = torch.tensor(actions[micro_idx], dtype=torch.float32, device=device)
-                        mb_old_logprobs = torch.tensor(old_logprobs[micro_idx], dtype=torch.float32, device=device)
-                        mb_adv = torch.tensor(advantages[micro_idx], dtype=torch.float32, device=device)
-                        mb_ret = torch.tensor(returns[micro_idx], dtype=torch.float32, device=device)
-                        mb_old_values = torch.tensor(values[micro_idx], dtype=torch.float32, device=device)
+                            mb_actions = torch.tensor(actions[micro_idx], dtype=torch.float32, device=device)
+                            mb_old_logprobs = torch.tensor(old_logprobs[micro_idx], dtype=torch.float32, device=device)
+                            mb_adv = torch.tensor(advantages[micro_idx], dtype=torch.float32, device=device)
+                            mb_ret = torch.tensor(returns[micro_idx], dtype=torch.float32, device=device)
+                            mb_old_values = torch.tensor(values[micro_idx], dtype=torch.float32, device=device)
 
-                        new_logprob = policy_dist.log_prob(mb_actions).sum(dim=-1)
-                        entropy = policy_dist.entropy().sum(dim=-1).mean()
-                        ratio = (new_logprob - mb_old_logprobs).exp()
+                            new_logprob = policy_dist.log_prob(mb_actions).sum(dim=-1)
+                            entropy = policy_dist.entropy().sum(dim=-1).mean()
+                            ratio = (new_logprob - mb_old_logprobs).exp()
 
-                        pg_loss1 = -mb_adv * ratio
-                        pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
-                        policy_loss = torch.max(pg_loss1, pg_loss2).mean()
+                            pg_loss1 = -mb_adv * ratio
+                            pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+                            policy_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                        value_pred_clipped = mb_old_values + torch.clamp(
-                            value_pred - mb_old_values,
-                            -args.clip_coef,
-                            args.clip_coef,
-                        )
-                        v_loss_unclipped = (value_pred - mb_ret) ** 2
-                        v_loss_clipped = (value_pred_clipped - mb_ret) ** 2
-                        value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                            value_pred_clipped = mb_old_values + torch.clamp(
+                                value_pred - mb_old_values,
+                                -args.clip_coef,
+                                args.clip_coef,
+                            )
+                            v_loss_unclipped = (value_pred - mb_ret) ** 2
+                            v_loss_clipped = (value_pred_clipped - mb_ret) ** 2
+                            value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
-                        loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
-                        (loss / micro_splits).backward()
+                            loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
+                            (loss / micro_splits).backward()
 
                     nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
                     optimizer.step()
