@@ -40,6 +40,10 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None  # type: ignore[assignment]
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
@@ -138,6 +142,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Yaw delta scale per action step.",
+    )
+    ap.add_argument(
+        "--hold_steps",
+        type=int,
+        default=6,
+        help=(
+            "How many simulator substeps to run after each env action. "
+            "Intermediate substeps skip frame capture; final substep captures frame for next observation."
+        ),
     )
     ap.add_argument("--capture_frames", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument(
@@ -1230,6 +1243,7 @@ class CDPRVisionLanguageEnv:
         max_steps: int,
         action_step_xyz: float,
         action_step_yaw: float,
+        hold_steps: int,
         capture_frames: bool,
         instruction_types: Optional[Sequence[str]],
         desk_textures_dir: str,
@@ -1282,6 +1296,7 @@ class CDPRVisionLanguageEnv:
         self._instruction = ""
         self.invert_x_action = bool(invert_x_action)
         self.invert_y_action = bool(invert_y_action)
+        self.hold_steps = max(1, int(hold_steps))
         self._scene_wrapper_cache: Dict[str, List[Path]] = {}
         self._texture_name_by_wrapper: Dict[str, str] = {}
 
@@ -1302,6 +1317,18 @@ class CDPRVisionLanguageEnv:
         if obj_mask is not None:
             obs_out["object_position_mask"] = np.asarray(obj_mask, dtype=np.float32)
 
+    def _advance_sim_substeps(self, capture_last_frame: bool = True) -> None:
+        sim = getattr(self.env, "sim", None)
+        if sim is None:
+            return
+        hold = max(1, int(self.hold_steps))
+        for sub_idx in range(hold):
+            capture = bool(capture_last_frame and sub_idx == (hold - 1))
+            try:
+                sim.run_simulation_step(capture_frame=capture)
+            except Exception:
+                break
+
     def reset(self, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         try:
             raw_obs, info = self.env.reset(options=options)
@@ -1311,10 +1338,7 @@ class CDPRVisionLanguageEnv:
         self._instruction = str(info.get("language_instruction", ""))
 
         # Ensure at least one captured frame exists after reset.
-        try:
-            self.env.sim.run_simulation_step(capture_frame=True)
-        except Exception:
-            pass
+        self._advance_sim_substeps(capture_last_frame=True)
 
         obs = {
             "image_primary": _latest_image_from_sim(self.env.sim, wrist=False),
@@ -1474,6 +1498,8 @@ class CDPRVisionLanguageEnv:
         if self.invert_y_action:
             action_env[1] *= -1.0
         raw_obs, reward, terminated, truncated, info = self.env.step(action_env)
+        # Increase effective control dt by running extra sim substeps after each action.
+        self._advance_sim_substeps(capture_last_frame=True)
         self._instruction = str(info.get("language_instruction", self._instruction))
 
         obs = {
@@ -1594,6 +1620,23 @@ def _float_or_none(value: Optional[float]) -> Optional[float]:
     return value_f
 
 
+def _normalize_object_name(raw_name: Any) -> str:
+    txt = str(raw_name or "").strip()
+    if not txt:
+        return ""
+    txt = re.sub(r"(?i)\bycb\b", "", txt)
+    txt = re.sub(r"[_\-\s]+", " ", txt).strip()
+    return txt
+
+
+def _extract_target_object_fields(info: Dict[str, Any]) -> Tuple[str, str, str]:
+    target_object_catalog = str(info.get("target_object_catalog", ""))
+    target_object_body = str(info.get("target_object_body", ""))
+    tracked_name = target_object_body if target_object_body else target_object_catalog
+    target_object_name = _normalize_object_name(tracked_name)
+    return target_object_catalog, target_object_body, target_object_name
+
+
 def _vec3_or_nan(value: Any) -> np.ndarray:
     if value is None:
         return np.full((3,), np.nan, dtype=np.float32)
@@ -1684,6 +1727,8 @@ def save_rollout_tap_npz(
         "instruction": np.asarray([str(r["instruction"]) for r in records], dtype=object),
         "instruction_type": np.asarray([str(r["instruction_type"]) for r in records], dtype=object),
         "target_object_catalog": np.asarray([str(r["target_object_catalog"]) for r in records], dtype=object),
+        "target_object_body": np.asarray([str(r["target_object_body"]) for r in records], dtype=object),
+        "target_object_name": np.asarray([str(r["target_object_name"]) for r in records], dtype=object),
         "env_done": np.asarray([bool(r["env_done"]) for r in records], dtype=bool),
         "forced_scene_refresh": np.asarray([bool(r["forced_scene_refresh"]) for r in records], dtype=bool),
     }
@@ -1713,6 +1758,8 @@ def run_validation_rollouts(
     episode_env_returns: List[float] = []
     episode_shaped_returns: List[float] = []
     episode_successes: List[float] = []
+    action_xyz_samples: List[np.ndarray] = []
+    target_objects_seen: set[str] = set()
 
     for ep_idx in range(1, int(num_episodes) + 1):
         ep_dir = val_root / f"episode_{ep_idx:02d}"
@@ -1740,11 +1787,15 @@ def run_validation_rollouts(
                     instructions=[obs["instruction"]],
                 )
             action_np = torch.clamp(mean_action, -1.0, 1.0)[0].cpu().numpy().astype(np.float32)
+            action_xyz_samples.append(np.asarray(action_np[:3], dtype=np.float32))
 
             dist_before = _distance_ee_to_target_from_obs(obs)
             with _silence_stdio(bool(quiet_env_logs)):
                 next_obs, env_reward, done, info = val_env.step(action_np)
             dist_after = _distance_ee_to_target_from_obs(next_obs)
+            target_object_catalog, target_object_body, target_object_name = _extract_target_object_fields(info)
+            if target_object_name:
+                target_objects_seen.add(target_object_name)
 
             shaped_reward, closer_bonus, farther_penalty, raw_delta = _shape_reward_with_delta_progress(
                 env_reward=env_reward,
@@ -1763,7 +1814,9 @@ def run_validation_rollouts(
                     "step": int(step_idx),
                     "instruction": str(obs.get("instruction", "")),
                     "scene": str(info.get("scene", "")),
-                    "target_object_catalog": str(info.get("target_object_catalog", "")),
+                    "target_object_catalog": target_object_catalog,
+                    "target_object_body": target_object_body,
+                    "target_object_name": target_object_name,
                     "action_delta": action_np.tolist(),
                     "action_delta_norm": float(np.linalg.norm(action_np)),
                     "value_pred": float(value.item()),
@@ -1799,6 +1852,9 @@ def run_validation_rollouts(
                     "shaped_return": float(shaped_return),
                     "success": bool(success),
                     "num_steps": int(len(steps)),
+                    "target_object_name": str(steps[-1]["target_object_name"]) if steps else "",
+                    "target_object_body": str(steps[-1]["target_object_body"]) if steps else "",
+                    "target_object_catalog": str(steps[-1]["target_object_catalog"]) if steps else "",
                 },
                 f_ep,
                 indent=2,
@@ -1809,12 +1865,45 @@ def run_validation_rollouts(
         episode_shaped_returns.append(float(shaped_return))
         episode_successes.append(1.0 if success else 0.0)
 
+    action_xyz = (
+        np.stack(action_xyz_samples, axis=0).astype(np.float32)
+        if action_xyz_samples
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    hist_edges = np.linspace(-1.0, 1.0, num=21, dtype=np.float32)
+    axis_names = ("x", "y", "z")
+    action_xyz_stats: Dict[str, Dict[str, Any]] = {}
+    action_xyz_hist: Dict[str, List[int]] = {}
+    for axis_idx, axis_name in enumerate(axis_names):
+        vals = action_xyz[:, axis_idx] if action_xyz.shape[0] > 0 else np.asarray([], dtype=np.float32)
+        if vals.size == 0:
+            action_xyz_stats[axis_name] = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+            action_xyz_hist[axis_name] = [0] * (len(hist_edges) - 1)
+            continue
+        hist_counts, _ = np.histogram(vals, bins=hist_edges)
+        action_xyz_stats[axis_name] = {
+            "mean": float(vals.mean()),
+            "std": float(vals.std()),
+            "min": float(vals.min()),
+            "max": float(vals.max()),
+        }
+        action_xyz_hist[axis_name] = [int(x) for x in hist_counts.tolist()]
+
     out = {
         "update": int(update),
         "episodes": int(num_episodes),
         "mean_env_return": float(np.mean(episode_env_returns)) if episode_env_returns else 0.0,
         "mean_shaped_return": float(np.mean(episode_shaped_returns)) if episode_shaped_returns else 0.0,
         "success_rate": float(np.mean(episode_successes)) if episode_successes else 0.0,
+        "target_objects_seen": sorted(target_objects_seen),
+        "action_xyz_stats": action_xyz_stats,
+        "action_xyz_hist_counts": action_xyz_hist,
+        "action_xyz_hist_edges": [float(x) for x in hist_edges.tolist()],
+        "action_xyz_samples": {
+            "x": [float(x) for x in action_xyz[:, 0].tolist()],
+            "y": [float(y) for y in action_xyz[:, 1].tolist()],
+            "z": [float(z) for z in action_xyz[:, 2].tolist()],
+        },
         "path": str(val_root),
     }
     with (val_root / "summary.json").open("w", encoding="utf-8") as f:
@@ -1857,6 +1946,9 @@ def main() -> None:
         raise ValueError("--validation_episodes must be >= 1.")
     if args.validation_max_steps < 1:
         raise ValueError("--validation_max_steps must be >= 1.")
+    if args.hold_steps < 1:
+        print("[WARN] --hold_steps must be >= 1; clamping to 1.", flush=True)
+        args.hold_steps = 1
     if args.scene_refresh_every_steps == 0:
         args.scene_refresh_every_steps = -1
     if args.validate_every_updates == 0:
@@ -1935,6 +2027,14 @@ def main() -> None:
         save_run_config(args, run_dir_local)
         print(f"Run dir: {run_dir_local}", flush=True)
     run_dir = Path(_broadcast_object(str(run_dir_local) if run_dir_local is not None else None, rank))
+    tb_writer = None
+    if is_main and SummaryWriter is not None:
+        tb_logdir = run_dir / "tensorboard"
+        tb_logdir.mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=str(tb_logdir), flush_secs=10)
+        print(f"[tensorboard] Logging to {tb_logdir}", flush=True)
+    elif is_main:
+        print("[WARN] TensorBoard logging disabled: torch.utils.tensorboard is unavailable.", flush=True)
 
     cdpr_root = _resolve_cdpr_dataset_root(Path(args.cdpr_dataset_root))
     _prune_generated_wrapper_artifacts(
@@ -2036,6 +2136,7 @@ def main() -> None:
                 max_steps=args.max_env_steps,
                 action_step_xyz=args.action_step_xyz,
                 action_step_yaw=args.action_step_yaw,
+                hold_steps=args.hold_steps,
                 capture_frames=args.capture_frames,
                 instruction_types=args.instruction_types,
                 desk_textures_dir=args.desk_textures_dir,
@@ -2076,6 +2177,7 @@ def main() -> None:
                 f"prebuild_scene_cache={bool(args.prebuild_scene_cache)} "
                 f"scene_pool_size={args.scene_pool_size} "
                 f"texture_pool_size={args.texture_pool_size} "
+                f"hold_steps={args.hold_steps} "
                 f"delta_closer_reward_coef={args.delta_closer_reward_coef} "
                 f"delta_farther_penalty_coef={args.delta_farther_penalty_coef} "
                 f"validate_every_updates={args.validate_every_updates} "
@@ -2102,6 +2204,7 @@ def main() -> None:
                     max_steps=args.max_env_steps,
                     action_step_xyz=args.action_step_xyz,
                     action_step_yaw=args.action_step_yaw,
+                    hold_steps=args.hold_steps,
                     capture_frames=args.capture_frames,
                     instruction_types=args.instruction_types,
                     desk_textures_dir=args.desk_textures_dir,
@@ -2137,6 +2240,10 @@ def main() -> None:
             policy.eval()
             transitions: List[Transition] = []
             rollout_records: List[Dict[str, Any]] = []
+            loss_policy_values: List[float] = []
+            loss_value_values: List[float] = []
+            loss_entropy_values: List[float] = []
+            loss_total_values: List[float] = []
             episode_returns = []
             episode_returns_env = []
             ep_ret = 0.0
@@ -2167,6 +2274,7 @@ def main() -> None:
                 dist_before = _distance_ee_to_target_from_obs(obs)
                 next_obs, env_reward, env_done, step_info = env.step(action_np)
                 dist_after = _distance_ee_to_target_from_obs(next_obs)
+                target_object_catalog, target_object_body, target_object_name = _extract_target_object_fields(step_info)
                 reward, closer_bonus, farther_penalty, raw_dist_delta = _shape_reward_with_delta_progress(
                     env_reward=env_reward,
                     distance_before=dist_before,
@@ -2221,7 +2329,9 @@ def main() -> None:
                         "scene": str(step_info.get("scene", "")),
                         "instruction": str(obs.get("instruction", "")),
                         "instruction_type": str(step_info.get("instruction_type", "")),
-                        "target_object_catalog": str(step_info.get("target_object_catalog", "")),
+                        "target_object_catalog": target_object_catalog,
+                        "target_object_body": target_object_body,
+                        "target_object_name": target_object_name,
                         "env_done": bool(env_done),
                         "forced_scene_refresh": bool(forced_scene_refresh),
                     }
@@ -2244,8 +2354,9 @@ def main() -> None:
                             "episode": int(episode_idx),
                             "global_step": int(global_step),
                             "scene": str(step_info.get("scene", "")),
-                            "target_object_catalog": str(step_info.get("target_object_catalog", "")),
-                            "target_object_body": str(step_info.get("target_object_body", "")),
+                            "target_object_catalog": target_object_catalog,
+                            "target_object_body": target_object_body,
+                            "target_object_name": target_object_name,
                             "instruction": str(step_info.get("language_instruction", "")),
                             "instruction_type": str(step_info.get("instruction_type", "")),
                             "success": bool(step_info.get("success", False)),
@@ -2368,6 +2479,11 @@ def main() -> None:
                             value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
                             loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * entropy
+                            with torch.no_grad():
+                                loss_policy_values.append(float(policy_loss.item()))
+                                loss_value_values.append(float(value_loss.item()))
+                                loss_entropy_values.append(float(entropy.item()))
+                                loss_total_values.append(float(loss.item()))
                             (loss / micro_splits).backward()
 
                     nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
@@ -2382,6 +2498,10 @@ def main() -> None:
             avg_rollout_reward_env = float(env_rewards.mean())
             avg_return = float(np.mean(episode_returns)) if episode_returns else ep_ret
             avg_return_env = float(np.mean(episode_returns_env)) if episode_returns_env else ep_ret_env
+            avg_policy_loss = float(np.mean(loss_policy_values)) if loss_policy_values else 0.0
+            avg_value_loss = float(np.mean(loss_value_values)) if loss_value_values else 0.0
+            avg_entropy = float(np.mean(loss_entropy_values)) if loss_entropy_values else 0.0
+            avg_total_loss = float(np.mean(loss_total_values)) if loss_total_values else 0.0
 
             if updates_pbar is not None:
                 updates_pbar.update(1)
@@ -2391,6 +2511,8 @@ def main() -> None:
                     r_shape=f"{avg_rollout_reward:.3f}",
                     ep_env=f"{avg_return_env:.3f}",
                     ep_shape=f"{avg_return:.3f}",
+                    l_pi=f"{avg_policy_loss:.3f}",
+                    l_v=f"{avg_value_loss:.3f}",
                     log_std=f"{float(policy_core.log_std.mean().item()):.3f}",
                 )
             elif is_main:
@@ -2401,9 +2523,23 @@ def main() -> None:
                     f"rollout_reward_shaped_mean={avg_rollout_reward:.4f} "
                     f"episode_return_env_mean={avg_return_env:.4f} "
                     f"episode_return_shaped_mean={avg_return:.4f} "
+                    f"loss_policy_mean={avg_policy_loss:.4f} "
+                    f"loss_value_mean={avg_value_loss:.4f} "
+                    f"entropy_mean={avg_entropy:.4f} "
+                    f"loss_total_mean={avg_total_loss:.4f} "
                     f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
                     flush=True,
                 )
+            if is_main and tb_writer is not None:
+                tb_writer.add_scalar("train/reward_env_mean", avg_rollout_reward_env, global_step)
+                tb_writer.add_scalar("train/reward_shaped_mean", avg_rollout_reward, global_step)
+                tb_writer.add_scalar("train/episode_return_env_mean", avg_return_env, global_step)
+                tb_writer.add_scalar("train/episode_return_shaped_mean", avg_return, global_step)
+                tb_writer.add_scalar("train/loss_policy_mean", avg_policy_loss, global_step)
+                tb_writer.add_scalar("train/loss_value_mean", avg_value_loss, global_step)
+                tb_writer.add_scalar("train/entropy_mean", avg_entropy, global_step)
+                tb_writer.add_scalar("train/loss_total_mean", avg_total_loss, global_step)
+                tb_writer.add_scalar("train/log_std_mean", float(policy_core.log_std.mean().item()), global_step)
 
             if (
                 is_main
@@ -2449,6 +2585,36 @@ def main() -> None:
                     f"path={val_summary['path']}",
                     flush=True,
                 )
+                xyz_stats = val_summary.get("action_xyz_stats", {})
+                if xyz_stats:
+                    print(
+                        f"[validation u{update:05d}] action_xyz "
+                        f"x(mean={xyz_stats['x']['mean']:.3f}, std={xyz_stats['x']['std']:.3f}) "
+                        f"y(mean={xyz_stats['y']['mean']:.3f}, std={xyz_stats['y']['std']:.3f}) "
+                        f"z(mean={xyz_stats['z']['mean']:.3f}, std={xyz_stats['z']['std']:.3f}) "
+                        f"targets={','.join(val_summary.get('target_objects_seen', []))}",
+                        flush=True,
+                    )
+                if tb_writer is not None:
+                    tb_writer.add_scalar("validation/env_return_mean", float(val_summary["mean_env_return"]), global_step)
+                    tb_writer.add_scalar("validation/shaped_return_mean", float(val_summary["mean_shaped_return"]), global_step)
+                    tb_writer.add_scalar("validation/success_rate", float(val_summary["success_rate"]), global_step)
+                    axis_samples = val_summary.get("action_xyz_samples", {})
+                    for axis in ("x", "y", "z"):
+                        stats_axis = xyz_stats.get(axis, {})
+                        tb_writer.add_scalar(
+                            f"validation/action_{axis}_mean",
+                            float(stats_axis.get("mean", 0.0)),
+                            global_step,
+                        )
+                        tb_writer.add_scalar(
+                            f"validation/action_{axis}_std",
+                            float(stats_axis.get("std", 0.0)),
+                            global_step,
+                        )
+                        vals = np.asarray(axis_samples.get(axis, []), dtype=np.float32)
+                        if vals.size > 0:
+                            tb_writer.add_histogram(f"validation/action_{axis}_hist", vals, global_step)
 
             if is_main and update % args.save_every == 0:
                 save_checkpoint(
@@ -2474,6 +2640,8 @@ def main() -> None:
             updates_pbar.close()
         if trace_fp is not None:
             trace_fp.close()
+        if tb_writer is not None:
+            tb_writer.close()
         if env is not None:
             with _silence_stdio(bool(args.quiet_env_logs)):
                 env.close()
