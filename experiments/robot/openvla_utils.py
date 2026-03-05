@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import time
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -71,24 +72,76 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
         print(f"Warning: No config.json found at {config_path}")
         return
 
-    # Create timestamped backup
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(pretrained_checkpoint, f"config.json.back.{timestamp}")
-    shutil.copy2(config_path, backup_path)
-    print(f"Created backup of original config at: {os.path.abspath(backup_path)}")
+    lock_path = f"{config_path}.lock"
+    lock_fp = open(lock_path, "w")
+    try:
+        try:
+            import fcntl  # type: ignore
 
-    # Read and update the config
-    with open(config_path, "r") as f:
-        config = json.load(f)
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            # If file locking is unavailable on a platform, continue without it.
+            pass
 
-    config["auto_map"] = {
-        "AutoConfig": "configuration_prismatic.OpenVLAConfig",
-        "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
-    }
+        # Robustly read config (helps if another process was midway through writing).
+        config = None
+        last_exc = None
+        for _ in range(10):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                break
+            except json.JSONDecodeError as exc:
+                last_exc = exc
+                time.sleep(0.1)
+        if config is None:
+            # Try recovering from previous backups if the current cache file is corrupted.
+            backup_candidates = sorted(
+                Path(pretrained_checkpoint).glob("config.json.back.*"),
+                key=lambda p: p.name,
+                reverse=True,
+            )
+            for backup in backup_candidates:
+                try:
+                    with open(backup, "r", encoding="utf-8") as f_b:
+                        config = json.load(f_b)
+                    print(
+                        f"⚠️ Recovered corrupted config.json from backup: {os.path.abspath(str(backup))}"
+                    )
+                    break
+                except Exception:
+                    continue
+        if config is None:
+            raise RuntimeError(f"Could not parse JSON config at {config_path}: {last_exc}")
 
-    # Write back the updated config
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+        # Create timestamped backup after successful parse.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(pretrained_checkpoint, f"config.json.back.{timestamp}")
+        with open(backup_path, "w", encoding="utf-8") as f_bak:
+            json.dump(config, f_bak, indent=2)
+        print(f"Created backup of original config at: {os.path.abspath(backup_path)}")
+
+        config["auto_map"] = {
+            "AutoConfig": "configuration_prismatic.OpenVLAConfig",
+            "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
+        }
+
+        # Write atomically to avoid partial JSON files.
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="config.json.tmp.", dir=pretrained_checkpoint, text=True)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f_tmp:
+                json.dump(config, f_tmp, indent=2)
+                f_tmp.flush()
+                os.fsync(f_tmp.fileno())
+            os.replace(tmp_path, config_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    finally:
+        try:
+            lock_fp.close()
+        except Exception:
+            pass
 
     print(f"Updated config.json at: {os.path.abspath(config_path)}")
     print("Changes made:")

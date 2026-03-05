@@ -251,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # PPO
-    ap.add_argument("--total_updates", type=int, default=70)
+    ap.add_argument("--total_updates", type=int, default=200)
     ap.add_argument("--rollout_steps", type=int, default=256)
     ap.add_argument("--ppo_epochs", type=int, default=4)
     ap.add_argument("--minibatch_size", type=int, default=4)
@@ -597,13 +597,20 @@ def _prune_generated_wrapper_artifacts(
     _broadcast_object({"removed": removed}, rank)
 
 
-def _resolve_and_prepare_vla_path(vla_path: str) -> str:
+def _resolve_and_prepare_vla_path(vla_path: str, rank: int = 0) -> str:
     # Mirror `finetune.py` behavior:
     # - For HF Hub models, download snapshot and use local path.
     # - For local models, register OpenVLA auto-classes.
     # - In both cases, sync config auto_map + local modeling/configuration files.
+    dist_ready = bool(dist.is_available() and dist.is_initialized())
+
     if model_is_on_hf_hub(vla_path):
-        resolved_path = snapshot_download(repo_id=vla_path)
+        if dist_ready:
+            resolved_path_local = snapshot_download(repo_id=vla_path) if rank == 0 else None
+            resolved_path = _broadcast_object(resolved_path_local, rank)
+            dist.barrier()
+        else:
+            resolved_path = snapshot_download(repo_id=vla_path)
     else:
         resolved_path = vla_path
         AutoConfig.register("openvla", OpenVLAConfig)
@@ -611,8 +618,15 @@ def _resolve_and_prepare_vla_path(vla_path: str) -> str:
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    update_auto_map(resolved_path)
-    check_model_logic_mismatch(resolved_path)
+    # Prevent concurrent write races on cached model config/modeling files in multi-process runs.
+    if dist_ready:
+        if rank == 0:
+            update_auto_map(resolved_path)
+            check_model_logic_mismatch(resolved_path)
+        dist.barrier()
+    else:
+        update_auto_map(resolved_path)
+        check_model_logic_mismatch(resolved_path)
     return resolved_path
 
 
@@ -884,8 +898,8 @@ def _extract_state_dict(maybe_state: Any) -> Dict[str, torch.Tensor]:
     return out
 
 
-def load_vla_and_processor(args: argparse.Namespace, device: torch.device):
-    resolved_vla_path = _resolve_and_prepare_vla_path(args.vla_path)
+def load_vla_and_processor(args: argparse.Namespace, device: torch.device, rank: int = 0):
+    resolved_vla_path = _resolve_and_prepare_vla_path(args.vla_path, rank=rank)
     print(f"[model] Loading VLA from: {resolved_vla_path}", flush=True)
 
     processor = AutoProcessor.from_pretrained(resolved_vla_path, trust_remote_code=True)
@@ -2051,7 +2065,7 @@ def main() -> None:
         max_textures=args.texture_pool_size if args.texture_pool_size > 0 else 128,
     )
 
-    vla, processor = load_vla_and_processor(args, device)
+    vla, processor = load_vla_and_processor(args, device, rank=rank)
     maybe_enable_gradient_checkpointing(vla, enabled=bool(args.gradient_checkpointing))
 
     llm_dim = _resolve_llm_dim(vla)
