@@ -2047,6 +2047,11 @@ def main() -> None:
         tb_logdir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(tb_logdir), flush_secs=10)
         print(f"[tensorboard] Logging to {tb_logdir}", flush=True)
+        print(
+            f"[tensorboard] train metrics: every update | validation metrics: "
+            f"{'disabled' if args.validate_every_updates <= 0 else f'every {args.validate_every_updates} updates'}",
+            flush=True,
+        )
     elif is_main:
         print("[WARN] TensorBoard logging disabled: torch.utils.tensorboard is unavailable.", flush=True)
 
@@ -2554,6 +2559,14 @@ def main() -> None:
                 tb_writer.add_scalar("train/entropy_mean", avg_entropy, global_step)
                 tb_writer.add_scalar("train/loss_total_mean", avg_total_loss, global_step)
                 tb_writer.add_scalar("train/log_std_mean", float(policy_core.log_std.mean().item()), global_step)
+                tb_writer.add_scalar("train/update_index", float(update), global_step)
+                tb_writer.add_scalar("train_by_update/reward_env_mean", avg_rollout_reward_env, update)
+                tb_writer.add_scalar("train_by_update/reward_shaped_mean", avg_rollout_reward, update)
+                tb_writer.add_scalar("train_by_update/loss_policy_mean", avg_policy_loss, update)
+                tb_writer.add_scalar("train_by_update/loss_value_mean", avg_value_loss, update)
+                tb_writer.add_scalar("train_by_update/entropy_mean", avg_entropy, update)
+                tb_writer.add_scalar("train_by_update/loss_total_mean", avg_total_loss, update)
+                tb_writer.flush()
 
             if (
                 is_main
