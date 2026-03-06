@@ -43,7 +43,10 @@ from torch.optim import AdamW
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
-    SummaryWriter = None  # type: ignore[assignment]
+    try:
+        from tensorboardX import SummaryWriter  # type: ignore
+    except Exception:
+        SummaryWriter = None  # type: ignore[assignment]
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
@@ -338,8 +341,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--validate_every_updates",
         type=int,
-        default=-1,
+        default=30,
         help="Run deterministic validation rollouts in a separate env every N PPO updates (rank 0). Use <=0 to disable.",
+    )
+    ap.add_argument(
+        "--tensorboard_every_updates",
+        type=int,
+        default=1,
+        help="Write TensorBoard train scalars every N PPO updates. Use <=0 to disable TensorBoard writes.",
     )
     ap.add_argument(
         "--validation_episodes",
@@ -1343,13 +1352,35 @@ class CDPRVisionLanguageEnv:
             except Exception:
                 break
 
+    @staticmethod
+    def _sanitize_instruction_text(instruction: str, info: Optional[Dict[str, Any]] = None) -> str:
+        txt = str(instruction or "")
+        info_dict = info if isinstance(info, dict) else {}
+
+        # Replace known object-name fields with cleaned variants first.
+        for key in ("target_object_body", "target_object_catalog"):
+            raw_name = str(info_dict.get(key, "")).strip()
+            if not raw_name:
+                continue
+            clean_name = _normalize_object_name(raw_name)
+            if clean_name:
+                txt = txt.replace(raw_name, clean_name)
+                txt = txt.replace(raw_name.replace("_", " "), clean_name)
+
+        # Generic cleanup for residual object-name fragments.
+        txt = re.sub(r"(?i)\bycb\b[_\-\s]*", "", txt)
+        txt = re.sub(r"(?i)\bp\d+\b", "", txt)
+        txt = txt.replace("_", " ")
+        txt = re.sub(r"\s{2,}", " ", txt).strip()
+        return txt
+
     def reset(self, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         try:
             raw_obs, info = self.env.reset(options=options)
         except TypeError:
             # Backward compatibility with env variants that don't accept `options`.
             raw_obs, info = self.env.reset()
-        self._instruction = str(info.get("language_instruction", ""))
+        self._instruction = self._sanitize_instruction_text(str(info.get("language_instruction", "")), info)
 
         # Ensure at least one captured frame exists after reset.
         self._advance_sim_substeps(capture_last_frame=True)
@@ -1514,7 +1545,13 @@ class CDPRVisionLanguageEnv:
         raw_obs, reward, terminated, truncated, info = self.env.step(action_env)
         # Increase effective control dt by running extra sim substeps after each action.
         self._advance_sim_substeps(capture_last_frame=True)
-        self._instruction = str(info.get("language_instruction", self._instruction))
+        self._instruction = self._sanitize_instruction_text(
+            str(info.get("language_instruction", self._instruction)),
+            info if isinstance(info, dict) else None,
+        )
+        if isinstance(info, dict):
+            info = dict(info)
+            info["language_instruction"] = self._instruction
 
         obs = {
             "image_primary": _latest_image_from_sim(self.env.sim, wrist=False),
@@ -1639,6 +1676,7 @@ def _normalize_object_name(raw_name: Any) -> str:
     if not txt:
         return ""
     txt = re.sub(r"(?i)\bycb\b", "", txt)
+    txt = re.sub(r"(?i)\bp\d+\b", "", txt)
     txt = re.sub(r"[_\-\s]+", " ", txt).strip()
     return txt
 
@@ -1967,6 +2005,8 @@ def main() -> None:
         args.scene_refresh_every_steps = -1
     if args.validate_every_updates == 0:
         args.validate_every_updates = -1
+    if args.tensorboard_every_updates == 0:
+        args.tensorboard_every_updates = -1
     if args.rollout_tap_every_updates == 0:
         args.rollout_tap_every_updates = -1
     if args.scene_pool_size == 0:
@@ -2048,7 +2088,9 @@ def main() -> None:
         tb_writer = SummaryWriter(log_dir=str(tb_logdir), flush_secs=10)
         print(f"[tensorboard] Logging to {tb_logdir}", flush=True)
         print(
-            f"[tensorboard] train metrics: every update | validation metrics: "
+            f"[tensorboard] train metrics: "
+            f"{'disabled' if args.tensorboard_every_updates <= 0 else f'every {args.tensorboard_every_updates} updates'} "
+            f"| validation metrics: "
             f"{'disabled' if args.validate_every_updates <= 0 else f'every {args.validate_every_updates} updates'}",
             flush=True,
         )
@@ -2549,7 +2591,12 @@ def main() -> None:
                     f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
                     flush=True,
                 )
-            if is_main and tb_writer is not None:
+            if (
+                is_main
+                and tb_writer is not None
+                and args.tensorboard_every_updates > 0
+                and (update % args.tensorboard_every_updates == 0)
+            ):
                 tb_writer.add_scalar("train/reward_env_mean", avg_rollout_reward_env, global_step)
                 tb_writer.add_scalar("train/reward_shaped_mean", avg_rollout_reward, global_step)
                 tb_writer.add_scalar("train/episode_return_env_mean", avg_return_env, global_step)
@@ -2560,12 +2607,6 @@ def main() -> None:
                 tb_writer.add_scalar("train/loss_total_mean", avg_total_loss, global_step)
                 tb_writer.add_scalar("train/log_std_mean", float(policy_core.log_std.mean().item()), global_step)
                 tb_writer.add_scalar("train/update_index", float(update), global_step)
-                tb_writer.add_scalar("train_by_update/reward_env_mean", avg_rollout_reward_env, update)
-                tb_writer.add_scalar("train_by_update/reward_shaped_mean", avg_rollout_reward, update)
-                tb_writer.add_scalar("train_by_update/loss_policy_mean", avg_policy_loss, update)
-                tb_writer.add_scalar("train_by_update/loss_value_mean", avg_value_loss, update)
-                tb_writer.add_scalar("train_by_update/entropy_mean", avg_entropy, update)
-                tb_writer.add_scalar("train_by_update/loss_total_mean", avg_total_loss, update)
                 tb_writer.flush()
 
             if (
