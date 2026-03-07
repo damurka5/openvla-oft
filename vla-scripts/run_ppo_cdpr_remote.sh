@@ -5,7 +5,8 @@ set -euo pipefail
 # Usage:
 #   bash vla-scripts/run_ppo_cdpr_remote.sh
 # Optional overrides:
-#   NPROC_PER_NODE=2 NUM_PARALLEL_ENVS=5 SCENE_POOL_SIZE=10 bash vla-scripts/run_ppo_cdpr_remote.sh
+#   NPROC_PER_NODE=2 NUM_PARALLEL_ENVS=5 SCENE_POOL_SIZE=10 ACTION_STEP_XYZ=0.015 HOLD_STEPS=10 \
+#   bash vla-scripts/run_ppo_cdpr_remote.sh
 
 REPO_ROOT="${REPO_ROOT:-/root/repo/openvla-oft}"
 SCRIPT_PATH="${SCRIPT_PATH:-$REPO_ROOT/vla-scripts/ppo_finetune_cdpr.py}"
@@ -29,6 +30,10 @@ VALIDATION_EPISODES="${VALIDATION_EPISODES:-1}"
 VALIDATION_MAX_STEPS="${VALIDATION_MAX_STEPS:-40}"
 ROLLOUT_TAP_EVERY_UPDATES="${ROLLOUT_TAP_EVERY_UPDATES:-10}"
 
+ACTION_STEP_XYZ="${ACTION_STEP_XYZ:-0.012}"
+ACTION_STEP_YAW="${ACTION_STEP_YAW:-0.08}"
+HOLD_STEPS="${HOLD_STEPS:-8}"
+
 cd "$REPO_ROOT"
 
 torchrun --nproc_per_node="$NPROC_PER_NODE" "$SCRIPT_PATH" \
@@ -40,6 +45,11 @@ torchrun --nproc_per_node="$NPROC_PER_NODE" "$SCRIPT_PATH" \
   --adam_eps 1e-5 \
   --weight_decay 0.0 \
   --normalize_advantage \
+  --action_step_xyz "$ACTION_STEP_XYZ" \
+  --action_step_yaw "$ACTION_STEP_YAW" \
+  --hold_steps "$HOLD_STEPS" \
+  --delta_closer_reward_coef 0 \
+  --delta_farther_penalty_coef 0 \
   --use_wrapper_cache \
   --no-wrapper_cleanup \
   --prebuild_scene_cache \

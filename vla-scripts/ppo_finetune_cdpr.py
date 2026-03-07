@@ -1844,6 +1844,41 @@ def _vec3_or_nan(value: Any) -> np.ndarray:
     return out
 
 
+def _motion_diagnostics(
+    action_xyz: np.ndarray,
+    ee_before: Any,
+    ee_after: Any,
+    action_step_xyz: float,
+) -> Dict[str, Any]:
+    action_xyz_arr = np.asarray(action_xyz, dtype=np.float32).reshape(-1)
+    if action_xyz_arr.shape[0] < 3:
+        action_xyz_arr = np.pad(action_xyz_arr, (0, max(0, 3 - action_xyz_arr.shape[0])))
+    commanded = action_xyz_arr[:3] * float(action_step_xyz)
+
+    ee_before_arr = np.asarray(ee_before, dtype=np.float32).reshape(-1) if ee_before is not None else np.asarray([], dtype=np.float32)
+    ee_after_arr = np.asarray(ee_after, dtype=np.float32).reshape(-1) if ee_after is not None else np.asarray([], dtype=np.float32)
+    if ee_before_arr.shape[0] < 3 or ee_after_arr.shape[0] < 3:
+        realized = np.full((3,), np.nan, dtype=np.float32)
+        gain = np.nan
+        cosine = np.nan
+    else:
+        realized = (ee_after_arr[:3] - ee_before_arr[:3]).astype(np.float32)
+        cmd_norm = float(np.linalg.norm(commanded))
+        real_norm = float(np.linalg.norm(realized))
+        gain = float(real_norm / max(cmd_norm, 1e-8))
+        if cmd_norm > 1e-8 and real_norm > 1e-8:
+            cosine = float(np.dot(commanded, realized) / (cmd_norm * real_norm))
+        else:
+            cosine = np.nan
+
+    return {
+        "commanded_xyz_delta": commanded.astype(np.float32),
+        "realized_xyz_delta": realized.astype(np.float32),
+        "realized_vs_command_gain": _float_or_none(gain),
+        "realized_vs_command_cosine": _float_or_none(cosine),
+    }
+
+
 def _stack_or_object(arrays: List[np.ndarray]) -> np.ndarray:
     if not arrays:
         return np.asarray([], dtype=np.float32)
@@ -1904,6 +1939,28 @@ def save_rollout_tap_npz(
         "r_orient": np.asarray([float(r.get("r_orient", 0.0)) for r in records], dtype=np.float32),
         "r_obj": np.asarray([float(r.get("r_obj", 0.0)) for r in records], dtype=np.float32),
         "r_success": np.asarray([float(r.get("r_success", 0.0)) for r in records], dtype=np.float32),
+        "commanded_xyz_delta": np.asarray(
+            [np.asarray(r.get("commanded_xyz_delta", np.full((3,), np.nan, dtype=np.float32)), dtype=np.float32) for r in records],
+            dtype=np.float32,
+        ),
+        "realized_xyz_delta": np.asarray(
+            [np.asarray(r.get("realized_xyz_delta", np.full((3,), np.nan, dtype=np.float32)), dtype=np.float32) for r in records],
+            dtype=np.float32,
+        ),
+        "realized_vs_command_gain": np.asarray(
+            [
+                np.nan if r.get("realized_vs_command_gain") is None else float(r.get("realized_vs_command_gain"))
+                for r in records
+            ],
+            dtype=np.float32,
+        ),
+        "realized_vs_command_cosine": np.asarray(
+            [
+                np.nan if r.get("realized_vs_command_cosine") is None else float(r.get("realized_vs_command_cosine"))
+                for r in records
+            ],
+            dtype=np.float32,
+        ),
         "distance_before": np.asarray(
             [np.nan if r["distance_before"] is None else float(r["distance_before"]) for r in records],
             dtype=np.float32,
@@ -1946,6 +2003,7 @@ def run_validation_rollouts(
     num_episodes: int,
     max_steps: int,
     num_images_in_input: int,
+    action_step_xyz: float,
     delta_closer_reward_coef: float,
     delta_farther_penalty_coef: float,
     save_frames: bool,
@@ -1962,6 +2020,8 @@ def run_validation_rollouts(
     episode_r_orient_mean: List[float] = []
     episode_r_obj_mean: List[float] = []
     episode_r_success_mean: List[float] = []
+    episode_motion_gain_mean: List[float] = []
+    episode_motion_cosine_mean: List[float] = []
     action_xyz_samples: List[np.ndarray] = []
     target_objects_seen: set[str] = set()
 
@@ -1979,6 +2039,8 @@ def run_validation_rollouts(
         ep_r_orient_sum = 0.0
         ep_r_obj_sum = 0.0
         ep_r_success_sum = 0.0
+        ep_motion_gain_vals: List[float] = []
+        ep_motion_cosine_vals: List[float] = []
         steps: List[Dict[str, Any]] = []
 
         for step_idx in range(int(max_steps)):
@@ -2000,6 +2062,12 @@ def run_validation_rollouts(
             dist_before = _distance_ee_to_target_from_obs(obs)
             with _silence_stdio(bool(quiet_env_logs)):
                 next_obs, env_reward, done, info = val_env.step(action_np)
+            motion_diag = _motion_diagnostics(
+                action_xyz=action_np[:3],
+                ee_before=obs.get("ee_position"),
+                ee_after=next_obs.get("ee_position"),
+                action_step_xyz=action_step_xyz,
+            )
             dist_after = _distance_ee_to_target_from_obs(next_obs)
             target_object_catalog, target_object_body, target_object_name = _extract_target_object_fields(info)
             if target_object_name:
@@ -2021,6 +2089,10 @@ def run_validation_rollouts(
             ep_r_orient_sum += float(reward_components["r_orient"])
             ep_r_obj_sum += float(reward_components["r_obj"])
             ep_r_success_sum += float(reward_components["r_success"])
+            if motion_diag["realized_vs_command_gain"] is not None:
+                ep_motion_gain_vals.append(float(motion_diag["realized_vs_command_gain"]))
+            if motion_diag["realized_vs_command_cosine"] is not None:
+                ep_motion_cosine_vals.append(float(motion_diag["realized_vs_command_cosine"]))
 
             steps.append(
                 {
@@ -2040,6 +2112,10 @@ def run_validation_rollouts(
                     "r_orient": float(reward_components["r_orient"]),
                     "r_obj": float(reward_components["r_obj"]),
                     "r_success": float(reward_components["r_success"]),
+                    "commanded_xyz_delta": np.asarray(motion_diag["commanded_xyz_delta"], dtype=np.float32).tolist(),
+                    "realized_xyz_delta": np.asarray(motion_diag["realized_xyz_delta"], dtype=np.float32).tolist(),
+                    "realized_vs_command_gain": motion_diag["realized_vs_command_gain"],
+                    "realized_vs_command_cosine": motion_diag["realized_vs_command_cosine"],
                     "closer_bonus": float(closer_bonus),
                     "farther_penalty": float(farther_penalty),
                     "distance_delta_raw": float(raw_delta),
@@ -2086,6 +2162,8 @@ def run_validation_rollouts(
         episode_r_orient_mean.append(float(ep_r_orient_sum / steps_count))
         episode_r_obj_mean.append(float(ep_r_obj_sum / steps_count))
         episode_r_success_mean.append(float(ep_r_success_sum / steps_count))
+        episode_motion_gain_mean.append(float(np.mean(ep_motion_gain_vals)) if ep_motion_gain_vals else 0.0)
+        episode_motion_cosine_mean.append(float(np.mean(ep_motion_cosine_vals)) if ep_motion_cosine_vals else 0.0)
 
     action_xyz = (
         np.stack(action_xyz_samples, axis=0).astype(np.float32)
@@ -2122,6 +2200,10 @@ def run_validation_rollouts(
             "r_orient": float(np.mean(episode_r_orient_mean)) if episode_r_orient_mean else 0.0,
             "r_obj": float(np.mean(episode_r_obj_mean)) if episode_r_obj_mean else 0.0,
             "r_success": float(np.mean(episode_r_success_mean)) if episode_r_success_mean else 0.0,
+        },
+        "motion_diagnostics": {
+            "realized_vs_command_gain_mean": float(np.mean(episode_motion_gain_mean)) if episode_motion_gain_mean else 0.0,
+            "realized_vs_command_cosine_mean": float(np.mean(episode_motion_cosine_mean)) if episode_motion_cosine_mean else 0.0,
         },
         "target_objects_seen": sorted(target_objects_seen),
         "action_xyz_stats": action_xyz_stats,
@@ -2536,6 +2618,8 @@ def main() -> None:
             reward_orient_values: List[float] = []
             reward_obj_values: List[float] = []
             reward_success_values: List[float] = []
+            motion_gain_values: List[float] = []
+            motion_cosine_values: List[float] = []
             episode_returns: List[float] = []
             episode_returns_env: List[float] = []
 
@@ -2585,6 +2669,12 @@ def main() -> None:
                     action_env = env_actions[env_idx]
                     dist_before = _distance_ee_to_target_from_obs(obs)
                     next_obs, env_reward, env_done, step_info = env.step(action_env)
+                    motion_diag = _motion_diagnostics(
+                        action_xyz=action_env[:3],
+                        ee_before=obs.get("ee_position"),
+                        ee_after=next_obs.get("ee_position"),
+                        action_step_xyz=args.action_step_xyz,
+                    )
                     dist_after = _distance_ee_to_target_from_obs(next_obs)
                     target_object_catalog, target_object_body, target_object_name = _extract_target_object_fields(step_info)
                     reward, closer_bonus, farther_penalty, raw_dist_delta = _shape_reward_with_delta_progress(
@@ -2614,6 +2704,10 @@ def main() -> None:
                     reward_orient_values.append(float(reward_components["r_orient"]))
                     reward_obj_values.append(float(reward_components["r_obj"]))
                     reward_success_values.append(float(reward_components["r_success"]))
+                    if motion_diag["realized_vs_command_gain"] is not None:
+                        motion_gain_values.append(float(motion_diag["realized_vs_command_gain"]))
+                    if motion_diag["realized_vs_command_cosine"] is not None:
+                        motion_cosine_values.append(float(motion_diag["realized_vs_command_cosine"]))
 
                     transitions.append(
                         Transition(
@@ -2641,6 +2735,10 @@ def main() -> None:
                             "r_orient": float(reward_components["r_orient"]),
                             "r_obj": float(reward_components["r_obj"]),
                             "r_success": float(reward_components["r_success"]),
+                            "commanded_xyz_delta": motion_diag["commanded_xyz_delta"],
+                            "realized_xyz_delta": motion_diag["realized_xyz_delta"],
+                            "realized_vs_command_gain": motion_diag["realized_vs_command_gain"],
+                            "realized_vs_command_cosine": motion_diag["realized_vs_command_cosine"],
                             "closer_bonus": float(closer_bonus),
                             "farther_penalty": float(farther_penalty),
                             "distance_before": _float_or_none(dist_before),
@@ -2698,6 +2796,10 @@ def main() -> None:
                                 "r_orient": float(reward_components["r_orient"]),
                                 "r_obj": float(reward_components["r_obj"]),
                                 "r_success": float(reward_components["r_success"]),
+                                "commanded_xyz_delta": np.asarray(motion_diag["commanded_xyz_delta"], dtype=np.float32).tolist(),
+                                "realized_xyz_delta": np.asarray(motion_diag["realized_xyz_delta"], dtype=np.float32).tolist(),
+                                "realized_vs_command_gain": motion_diag["realized_vs_command_gain"],
+                                "realized_vs_command_cosine": motion_diag["realized_vs_command_cosine"],
                                 "closer_bonus": float(closer_bonus),
                                 "farther_penalty": float(farther_penalty),
                                 "distance_delta_raw": float(raw_dist_delta),
@@ -2890,6 +2992,8 @@ def main() -> None:
             avg_r_orient = float(np.mean(reward_orient_values)) if reward_orient_values else 0.0
             avg_r_obj = float(np.mean(reward_obj_values)) if reward_obj_values else 0.0
             avg_r_success = float(np.mean(reward_success_values)) if reward_success_values else 0.0
+            avg_motion_gain = float(np.mean(motion_gain_values)) if motion_gain_values else 0.0
+            avg_motion_cosine = float(np.mean(motion_cosine_values)) if motion_cosine_values else 0.0
 
             if updates_pbar is not None:
                 updates_pbar.update(1)
@@ -2922,6 +3026,8 @@ def main() -> None:
                     f"r_orient_mean={avg_r_orient:.4f} "
                     f"r_obj_mean={avg_r_obj:.4f} "
                     f"r_success_mean={avg_r_success:.4f} "
+                    f"motion_gain_mean={avg_motion_gain:.4f} "
+                    f"motion_cosine_mean={avg_motion_cosine:.4f} "
                     f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
                     flush=True,
                 )
@@ -2945,6 +3051,8 @@ def main() -> None:
                 tb_writer.add_scalar("train/reward_component_r_orient_mean", avg_r_orient, global_step)
                 tb_writer.add_scalar("train/reward_component_r_obj_mean", avg_r_obj, global_step)
                 tb_writer.add_scalar("train/reward_component_r_success_mean", avg_r_success, global_step)
+                tb_writer.add_scalar("train/motion_realized_vs_command_gain_mean", avg_motion_gain, global_step)
+                tb_writer.add_scalar("train/motion_realized_vs_command_cosine_mean", avg_motion_cosine, global_step)
                 tb_writer.add_scalar("train/log_std_mean", float(policy_core.log_std.mean().item()), global_step)
                 tb_writer.add_scalar("train/update_index", float(update), global_step)
                 tb_writer.flush()
@@ -2979,6 +3087,7 @@ def main() -> None:
                     num_episodes=args.validation_episodes,
                     max_steps=args.validation_max_steps,
                     num_images_in_input=args.num_images_in_input,
+                    action_step_xyz=args.action_step_xyz,
                     delta_closer_reward_coef=args.delta_closer_reward_coef,
                     delta_farther_penalty_coef=args.delta_farther_penalty_coef,
                     save_frames=bool(args.save_validation_frames),
@@ -3001,6 +3110,14 @@ def main() -> None:
                         f"r_orient={float(reward_means.get('r_orient', 0.0)):.4f} "
                         f"r_obj={float(reward_means.get('r_obj', 0.0)):.4f} "
                         f"r_success={float(reward_means.get('r_success', 0.0)):.4f}",
+                        flush=True,
+                    )
+                motion_diag_val = val_summary.get("motion_diagnostics", {})
+                if motion_diag_val:
+                    print(
+                        f"[validation u{update:05d}] motion "
+                        f"gain={float(motion_diag_val.get('realized_vs_command_gain_mean', 0.0)):.4f} "
+                        f"cosine={float(motion_diag_val.get('realized_vs_command_cosine_mean', 0.0)):.4f}",
                         flush=True,
                     )
                 xyz_stats = val_summary.get("action_xyz_stats", {})
@@ -3035,6 +3152,16 @@ def main() -> None:
                     tb_writer.add_scalar(
                         "validation/reward_component_r_success_mean",
                         float(reward_means.get("r_success", 0.0)),
+                        global_step,
+                    )
+                    tb_writer.add_scalar(
+                        "validation/motion_realized_vs_command_gain_mean",
+                        float(motion_diag_val.get("realized_vs_command_gain_mean", 0.0)),
+                        global_step,
+                    )
+                    tb_writer.add_scalar(
+                        "validation/motion_realized_vs_command_cosine_mean",
+                        float(motion_diag_val.get("realized_vs_command_cosine_mean", 0.0)),
                         global_step,
                     )
                     axis_samples = val_summary.get("action_xyz_samples", {})
