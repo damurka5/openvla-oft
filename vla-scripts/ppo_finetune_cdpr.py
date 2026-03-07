@@ -1755,6 +1755,84 @@ def _extract_target_object_fields(info: Dict[str, Any]) -> Tuple[str, str, str]:
     return target_object_catalog, target_object_body, target_object_name
 
 
+def _finite_float_or_none(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _first_reward_value(info: Dict[str, Any], candidates: Sequence[str]) -> float:
+    for key in candidates:
+        if key not in info:
+            continue
+        val = _finite_float_or_none(info.get(key))
+        if val is not None:
+            return float(val)
+    return 0.0
+
+
+def _extract_reward_components(info: Dict[str, Any]) -> Dict[str, float]:
+    # Support several key aliases to stay compatible with CDPR reward-function revisions.
+    r_xyz = _first_reward_value(
+        info,
+        (
+            "r_xyz",
+            "xyz_progress_reward",
+            "approach_reward",
+            "distance_reward",
+            "ee_progress_reward",
+        ),
+    )
+    r_orient = _first_reward_value(
+        info,
+        (
+            "r_orient",
+            "orient_reward",
+            "orientation_reward",
+            "yaw_reward",
+            "orientation_alignment_reward",
+        ),
+    )
+    r_obj = _first_reward_value(
+        info,
+        (
+            "r_obj",
+            "obj_reward",
+            "obj_motion_reward",
+            "object_motion_reward",
+            "task_progress_reward",
+        ),
+    )
+    r_lift = _first_reward_value(
+        info,
+        (
+            "lift_reward",
+            "pick_lift_reward",
+            "r_lift",
+        ),
+    )
+    r_success = _first_reward_value(
+        info,
+        (
+            "r_success",
+            "success_reward",
+            "success_bonus",
+            "terminal_success_bonus",
+        ),
+    )
+    # For pick tasks, lift/progress should be tracked inside the generic object-progress stream.
+    return {
+        "r_xyz": float(r_xyz),
+        "r_orient": float(r_orient),
+        "r_obj": float(r_obj + r_lift),
+        "r_success": float(r_success),
+    }
+
+
 def _vec3_or_nan(value: Any) -> np.ndarray:
     if value is None:
         return np.full((3,), np.nan, dtype=np.float32)
@@ -1822,6 +1900,10 @@ def save_rollout_tap_npz(
         "reward_shaped": np.asarray([float(r["reward_shaped"]) for r in records], dtype=np.float32),
         "closer_bonus": np.asarray([float(r["closer_bonus"]) for r in records], dtype=np.float32),
         "farther_penalty": np.asarray([float(r["farther_penalty"]) for r in records], dtype=np.float32),
+        "r_xyz": np.asarray([float(r.get("r_xyz", 0.0)) for r in records], dtype=np.float32),
+        "r_orient": np.asarray([float(r.get("r_orient", 0.0)) for r in records], dtype=np.float32),
+        "r_obj": np.asarray([float(r.get("r_obj", 0.0)) for r in records], dtype=np.float32),
+        "r_success": np.asarray([float(r.get("r_success", 0.0)) for r in records], dtype=np.float32),
         "distance_before": np.asarray(
             [np.nan if r["distance_before"] is None else float(r["distance_before"]) for r in records],
             dtype=np.float32,
@@ -1876,6 +1958,10 @@ def run_validation_rollouts(
     episode_env_returns: List[float] = []
     episode_shaped_returns: List[float] = []
     episode_successes: List[float] = []
+    episode_r_xyz_mean: List[float] = []
+    episode_r_orient_mean: List[float] = []
+    episode_r_obj_mean: List[float] = []
+    episode_r_success_mean: List[float] = []
     action_xyz_samples: List[np.ndarray] = []
     target_objects_seen: set[str] = set()
 
@@ -1889,6 +1975,10 @@ def run_validation_rollouts(
         env_return = 0.0
         shaped_return = 0.0
         success = False
+        ep_r_xyz_sum = 0.0
+        ep_r_orient_sum = 0.0
+        ep_r_obj_sum = 0.0
+        ep_r_success_sum = 0.0
         steps: List[Dict[str, Any]] = []
 
         for step_idx in range(int(max_steps)):
@@ -1922,10 +2012,15 @@ def run_validation_rollouts(
                 delta_closer_reward_coef=delta_closer_reward_coef,
                 delta_farther_penalty_coef=delta_farther_penalty_coef,
             )
+            reward_components = _extract_reward_components(info if isinstance(info, dict) else {})
 
             env_return += float(env_reward)
             shaped_return += float(shaped_reward)
             success = bool(info.get("success", success))
+            ep_r_xyz_sum += float(reward_components["r_xyz"])
+            ep_r_orient_sum += float(reward_components["r_orient"])
+            ep_r_obj_sum += float(reward_components["r_obj"])
+            ep_r_success_sum += float(reward_components["r_success"])
 
             steps.append(
                 {
@@ -1941,6 +2036,10 @@ def run_validation_rollouts(
                     "std_mean": float(std_action.mean().item()),
                     "reward_env": float(env_reward),
                     "reward_shaped": float(shaped_reward),
+                    "r_xyz": float(reward_components["r_xyz"]),
+                    "r_orient": float(reward_components["r_orient"]),
+                    "r_obj": float(reward_components["r_obj"]),
+                    "r_success": float(reward_components["r_success"]),
                     "closer_bonus": float(closer_bonus),
                     "farther_penalty": float(farther_penalty),
                     "distance_delta_raw": float(raw_delta),
@@ -1982,6 +2081,11 @@ def run_validation_rollouts(
         episode_env_returns.append(float(env_return))
         episode_shaped_returns.append(float(shaped_return))
         episode_successes.append(1.0 if success else 0.0)
+        steps_count = max(1, len(steps))
+        episode_r_xyz_mean.append(float(ep_r_xyz_sum / steps_count))
+        episode_r_orient_mean.append(float(ep_r_orient_sum / steps_count))
+        episode_r_obj_mean.append(float(ep_r_obj_sum / steps_count))
+        episode_r_success_mean.append(float(ep_r_success_sum / steps_count))
 
     action_xyz = (
         np.stack(action_xyz_samples, axis=0).astype(np.float32)
@@ -2013,6 +2117,12 @@ def run_validation_rollouts(
         "mean_env_return": float(np.mean(episode_env_returns)) if episode_env_returns else 0.0,
         "mean_shaped_return": float(np.mean(episode_shaped_returns)) if episode_shaped_returns else 0.0,
         "success_rate": float(np.mean(episode_successes)) if episode_successes else 0.0,
+        "reward_component_means": {
+            "r_xyz": float(np.mean(episode_r_xyz_mean)) if episode_r_xyz_mean else 0.0,
+            "r_orient": float(np.mean(episode_r_orient_mean)) if episode_r_orient_mean else 0.0,
+            "r_obj": float(np.mean(episode_r_obj_mean)) if episode_r_obj_mean else 0.0,
+            "r_success": float(np.mean(episode_r_success_mean)) if episode_r_success_mean else 0.0,
+        },
         "target_objects_seen": sorted(target_objects_seen),
         "action_xyz_stats": action_xyz_stats,
         "action_xyz_hist_counts": action_xyz_hist,
@@ -2422,6 +2532,10 @@ def main() -> None:
             loss_total_values: List[float] = []
             approx_kl_values: List[float] = []
             clip_fraction_values: List[float] = []
+            reward_xyz_values: List[float] = []
+            reward_orient_values: List[float] = []
+            reward_obj_values: List[float] = []
+            reward_success_values: List[float] = []
             episode_returns: List[float] = []
             episode_returns_env: List[float] = []
 
@@ -2480,6 +2594,7 @@ def main() -> None:
                         delta_closer_reward_coef=args.delta_closer_reward_coef,
                         delta_farther_penalty_coef=args.delta_farther_penalty_coef,
                     )
+                    reward_components = _extract_reward_components(step_info if isinstance(step_info, dict) else {})
 
                     steps_since_reset[env_idx] += 1
                     global_step += 1
@@ -2495,6 +2610,10 @@ def main() -> None:
                     values_buf[rollout_step, env_idx] = float(value_np[env_idx])
                     actions_buf[rollout_step, env_idx] = sampled_actions[env_idx]
                     old_logprobs_buf[rollout_step, env_idx] = float(logprob_np[env_idx])
+                    reward_xyz_values.append(float(reward_components["r_xyz"]))
+                    reward_orient_values.append(float(reward_components["r_orient"]))
+                    reward_obj_values.append(float(reward_components["r_obj"]))
+                    reward_success_values.append(float(reward_components["r_success"]))
 
                     transitions.append(
                         Transition(
@@ -2518,6 +2637,10 @@ def main() -> None:
                             "action_delta_norm": float(np.linalg.norm(action_env)),
                             "reward_env": float(env_reward),
                             "reward_shaped": float(reward),
+                            "r_xyz": float(reward_components["r_xyz"]),
+                            "r_orient": float(reward_components["r_orient"]),
+                            "r_obj": float(reward_components["r_obj"]),
+                            "r_success": float(reward_components["r_success"]),
                             "closer_bonus": float(closer_bonus),
                             "farther_penalty": float(farther_penalty),
                             "distance_before": _float_or_none(dist_before),
@@ -2571,6 +2694,10 @@ def main() -> None:
                                 "forced_scene_refresh": bool(forced_scene_refresh),
                                 "reward_env": float(env_reward),
                                 "reward_shaped": float(reward),
+                                "r_xyz": float(reward_components["r_xyz"]),
+                                "r_orient": float(reward_components["r_orient"]),
+                                "r_obj": float(reward_components["r_obj"]),
+                                "r_success": float(reward_components["r_success"]),
                                 "closer_bonus": float(closer_bonus),
                                 "farther_penalty": float(farther_penalty),
                                 "distance_delta_raw": float(raw_dist_delta),
@@ -2759,6 +2886,10 @@ def main() -> None:
             avg_total_loss = float(np.mean(loss_total_values)) if loss_total_values else 0.0
             avg_approx_kl = float(np.mean(approx_kl_values)) if approx_kl_values else 0.0
             avg_clip_fraction = float(np.mean(clip_fraction_values)) if clip_fraction_values else 0.0
+            avg_r_xyz = float(np.mean(reward_xyz_values)) if reward_xyz_values else 0.0
+            avg_r_orient = float(np.mean(reward_orient_values)) if reward_orient_values else 0.0
+            avg_r_obj = float(np.mean(reward_obj_values)) if reward_obj_values else 0.0
+            avg_r_success = float(np.mean(reward_success_values)) if reward_success_values else 0.0
 
             if updates_pbar is not None:
                 updates_pbar.update(1)
@@ -2787,6 +2918,10 @@ def main() -> None:
                     f"loss_total_mean={avg_total_loss:.4f} "
                     f"approx_kl_mean={avg_approx_kl:.6f} "
                     f"clip_fraction_mean={avg_clip_fraction:.4f} "
+                    f"r_xyz_mean={avg_r_xyz:.4f} "
+                    f"r_orient_mean={avg_r_orient:.4f} "
+                    f"r_obj_mean={avg_r_obj:.4f} "
+                    f"r_success_mean={avg_r_success:.4f} "
                     f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
                     flush=True,
                 )
@@ -2806,6 +2941,10 @@ def main() -> None:
                 tb_writer.add_scalar("train/loss_total_mean", avg_total_loss, global_step)
                 tb_writer.add_scalar("train/approx_kl_mean", avg_approx_kl, global_step)
                 tb_writer.add_scalar("train/clip_fraction_mean", avg_clip_fraction, global_step)
+                tb_writer.add_scalar("train/reward_component_r_xyz_mean", avg_r_xyz, global_step)
+                tb_writer.add_scalar("train/reward_component_r_orient_mean", avg_r_orient, global_step)
+                tb_writer.add_scalar("train/reward_component_r_obj_mean", avg_r_obj, global_step)
+                tb_writer.add_scalar("train/reward_component_r_success_mean", avg_r_success, global_step)
                 tb_writer.add_scalar("train/log_std_mean", float(policy_core.log_std.mean().item()), global_step)
                 tb_writer.add_scalar("train/update_index", float(update), global_step)
                 tb_writer.flush()
@@ -2854,6 +2993,16 @@ def main() -> None:
                     f"path={val_summary['path']}",
                     flush=True,
                 )
+                reward_means = val_summary.get("reward_component_means", {})
+                if reward_means:
+                    print(
+                        f"[validation u{update:05d}] reward_components "
+                        f"r_xyz={float(reward_means.get('r_xyz', 0.0)):.4f} "
+                        f"r_orient={float(reward_means.get('r_orient', 0.0)):.4f} "
+                        f"r_obj={float(reward_means.get('r_obj', 0.0)):.4f} "
+                        f"r_success={float(reward_means.get('r_success', 0.0)):.4f}",
+                        flush=True,
+                    )
                 xyz_stats = val_summary.get("action_xyz_stats", {})
                 if xyz_stats:
                     print(
@@ -2868,6 +3017,26 @@ def main() -> None:
                     tb_writer.add_scalar("validation/env_return_mean", float(val_summary["mean_env_return"]), global_step)
                     tb_writer.add_scalar("validation/shaped_return_mean", float(val_summary["mean_shaped_return"]), global_step)
                     tb_writer.add_scalar("validation/success_rate", float(val_summary["success_rate"]), global_step)
+                    tb_writer.add_scalar(
+                        "validation/reward_component_r_xyz_mean",
+                        float(reward_means.get("r_xyz", 0.0)),
+                        global_step,
+                    )
+                    tb_writer.add_scalar(
+                        "validation/reward_component_r_orient_mean",
+                        float(reward_means.get("r_orient", 0.0)),
+                        global_step,
+                    )
+                    tb_writer.add_scalar(
+                        "validation/reward_component_r_obj_mean",
+                        float(reward_means.get("r_obj", 0.0)),
+                        global_step,
+                    )
+                    tb_writer.add_scalar(
+                        "validation/reward_component_r_success_mean",
+                        float(reward_means.get("r_success", 0.0)),
+                        global_step,
+                    )
                     axis_samples = val_summary.get("action_xyz_samples", {})
                     for axis in ("x", "y", "z"):
                         stats_axis = xyz_stats.get(axis, {})
