@@ -254,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # PPO
-    ap.add_argument("--total_updates", type=int, default=200)
+    ap.add_argument("--total_updates", type=int, default=100)
     ap.add_argument("--rollout_steps", type=int, default=256)
     ap.add_argument(
         "--num_parallel_envs",
@@ -351,7 +351,7 @@ def parse_args() -> argparse.Namespace:
             "Can avoid 'Expected to mark a variable ready only once' errors."
         ),
     )
-    ap.add_argument("--save_every", type=int, default=100)
+    ap.add_argument("--save_every", type=int, default=20)
     ap.add_argument(
         "--status_bar",
         action=argparse.BooleanOptionalAction,
@@ -1516,14 +1516,19 @@ class CDPRVisionLanguageEnv:
             if not scene_name or not scene_objects:
                 continue
 
+            ee_start = np.asarray(rl.defaults.get("ee_start", (0.0, 0.0, 0.35)), dtype=np.float32).reshape(-1)
+            if ee_start.shape[0] < 3:
+                ee_start = np.pad(ee_start, (0, 3 - ee_start.shape[0]), mode="constant")
+            ee_start[2] = max(float(ee_start[2]), 0.35)
+
             base_wrapper = Path(
                 build_wrapper_if_needed(
                     scene_name=scene_name,
                     object_names=scene_objects,
                     scene_z=rl.defaults.get("scene_z", -0.85),
-                    ee_start=rl.defaults.get("ee_start", (0.0, 0.0, 0.25)),
+                    ee_start=tuple(float(x) for x in ee_start[:3]),
                     table_z=rl.defaults.get("table_z", 0.15),
-                    settle_time=rl.defaults.get("settle_time", 1.0),
+                    settle_time=rl.defaults.get("settle_time", 0.0),
                     wrapper_out=None,
                     use_cache=True,
                 )
@@ -2023,6 +2028,7 @@ def run_validation_rollouts(
     episode_motion_gain_mean: List[float] = []
     episode_motion_cosine_mean: List[float] = []
     action_xyz_samples: List[np.ndarray] = []
+    action_samples: List[np.ndarray] = []
     target_objects_seen: set[str] = set()
 
     for ep_idx in range(1, int(num_episodes) + 1):
@@ -2058,6 +2064,7 @@ def run_validation_rollouts(
                 )
             action_np = torch.clamp(mean_action, -1.0, 1.0)[0].cpu().numpy().astype(np.float32)
             action_xyz_samples.append(np.asarray(action_np[:3], dtype=np.float32))
+            action_samples.append(np.asarray(action_np, dtype=np.float32))
 
             dist_before = _distance_ee_to_target_from_obs(obs)
             with _silence_stdio(bool(quiet_env_logs)):
@@ -2170,6 +2177,11 @@ def run_validation_rollouts(
         if action_xyz_samples
         else np.zeros((0, 3), dtype=np.float32)
     )
+    action_all = (
+        np.stack(action_samples, axis=0).astype(np.float32)
+        if action_samples
+        else np.zeros((0, ACTION_DIM), dtype=np.float32)
+    )
     hist_edges = np.linspace(-1.0, 1.0, num=21, dtype=np.float32)
     axis_names = ("x", "y", "z")
     action_xyz_stats: Dict[str, Dict[str, Any]] = {}
@@ -2189,6 +2201,31 @@ def run_validation_rollouts(
         }
         action_xyz_hist[axis_name] = [int(x) for x in hist_counts.tolist()]
 
+    action_dim_names = ("x", "y", "z", "yaw", "gripper")
+    action_dim_stats: Dict[str, Dict[str, float]] = {}
+    if action_all.shape[0] > 0:
+        for dim_idx in range(int(action_all.shape[1])):
+            dim_name = action_dim_names[dim_idx] if dim_idx < len(action_dim_names) else f"a{dim_idx}"
+            vals = action_all[:, dim_idx]
+            sat_frac = float(np.mean(np.abs(vals) >= 0.99))
+            action_dim_stats[dim_name] = {
+                "mean": float(vals.mean()),
+                "std": float(vals.std()),
+                "min": float(vals.min()),
+                "max": float(vals.max()),
+                "sat_frac_abs_ge_0_99": sat_frac,
+            }
+    else:
+        for dim_idx in range(min(int(ACTION_DIM), len(action_dim_names))):
+            dim_name = action_dim_names[dim_idx]
+            action_dim_stats[dim_name] = {
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+                "sat_frac_abs_ge_0_99": 0.0,
+            }
+
     out = {
         "update": int(update),
         "episodes": int(num_episodes),
@@ -2206,6 +2243,7 @@ def run_validation_rollouts(
             "realized_vs_command_cosine_mean": float(np.mean(episode_motion_cosine_mean)) if episode_motion_cosine_mean else 0.0,
         },
         "target_objects_seen": sorted(target_objects_seen),
+        "action_dim_stats": action_dim_stats,
         "action_xyz_stats": action_xyz_stats,
         "action_xyz_hist_counts": action_xyz_hist,
         "action_xyz_hist_edges": [float(x) for x in hist_edges.tolist()],
@@ -3130,6 +3168,21 @@ def main() -> None:
                         f"targets={','.join(val_summary.get('target_objects_seen', []))}",
                         flush=True,
                     )
+                action_dim_stats = val_summary.get("action_dim_stats", {})
+                if action_dim_stats:
+                    sat_parts: List[str] = []
+                    for axis in ("x", "z", "yaw", "gripper"):
+                        axis_stats = action_dim_stats.get(axis)
+                        if not isinstance(axis_stats, dict):
+                            continue
+                        sat_parts.append(
+                            f"{axis}={100.0 * float(axis_stats.get('sat_frac_abs_ge_0_99', 0.0)):.1f}%"
+                        )
+                    if sat_parts:
+                        print(
+                            f"[validation u{update:05d}] action_saturation " + " ".join(sat_parts),
+                            flush=True,
+                        )
                 if tb_writer is not None:
                     tb_writer.add_scalar("validation/env_return_mean", float(val_summary["mean_env_return"]), global_step)
                     tb_writer.add_scalar("validation/shaped_return_mean", float(val_summary["mean_shaped_return"]), global_step)
@@ -3180,6 +3233,14 @@ def main() -> None:
                         vals = np.asarray(axis_samples.get(axis, []), dtype=np.float32)
                         if vals.size > 0:
                             tb_writer.add_histogram(f"validation/action_{axis}_hist", vals, global_step)
+                    for axis, axis_stats in action_dim_stats.items():
+                        if not isinstance(axis_stats, dict):
+                            continue
+                        tb_writer.add_scalar(
+                            f"validation/action_{axis}_sat_frac_abs_ge_0_99",
+                            float(axis_stats.get("sat_frac_abs_ge_0_99", 0.0)),
+                            global_step,
+                        )
 
             if is_main and update % args.save_every == 0:
                 save_checkpoint(

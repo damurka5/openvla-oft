@@ -6,6 +6,7 @@ set -euo pipefail
 #   bash vla-scripts/run_ppo_cdpr_remote.sh
 # Optional overrides:
 #   NPROC_PER_NODE=2 NUM_PARALLEL_ENVS=5 SCENE_POOL_SIZE=10 ACTION_STEP_XYZ=0.015 HOLD_STEPS=10 \
+#   TOTAL_UPDATES=100 SAVE_EVERY=20 \
 #   bash vla-scripts/run_ppo_cdpr_remote.sh
 
 REPO_ROOT="${REPO_ROOT:-/root/repo/openvla-oft}"
@@ -29,6 +30,8 @@ VALIDATE_EVERY_UPDATES="${VALIDATE_EVERY_UPDATES:-10}"
 VALIDATION_EPISODES="${VALIDATION_EPISODES:-1}"
 VALIDATION_MAX_STEPS="${VALIDATION_MAX_STEPS:-40}"
 ROLLOUT_TAP_EVERY_UPDATES="${ROLLOUT_TAP_EVERY_UPDATES:-10}"
+TOTAL_UPDATES="${TOTAL_UPDATES:-100}"
+SAVE_EVERY="${SAVE_EVERY:-20}"
 
 ACTION_STEP_XYZ="${ACTION_STEP_XYZ:-0.012}"
 ACTION_STEP_YAW="${ACTION_STEP_YAW:-0.08}"
@@ -62,4 +65,6 @@ torchrun --nproc_per_node="$NPROC_PER_NODE" "$SCRIPT_PATH" \
   --validation_max_steps "$VALIDATION_MAX_STEPS" \
   --save_validation_frames \
   --rollout_tap_every_updates "$ROLLOUT_TAP_EVERY_UPDATES" \
+  --total_updates "$TOTAL_UPDATES" \
+  --save_every "$SAVE_EVERY" \
   --env_trace_path "$ENV_TRACE_PATH"
