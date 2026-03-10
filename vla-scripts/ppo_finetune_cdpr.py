@@ -326,6 +326,57 @@ def parse_args() -> argparse.Namespace:
             "(delta action moves farther from target)."
         ),
     )
+    ap.add_argument(
+        "--reward_clip_abs",
+        type=float,
+        default=120.0,
+        help=(
+            "Clip absolute reward magnitude before storing PPO transitions. "
+            "Use <=0 to disable clipping."
+        ),
+    )
+    ap.add_argument(
+        "--guard_unstable_transitions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Detect unstable sim transitions (teleports/reward spikes) and force reset "
+            "with a fixed penalty reward."
+        ),
+    )
+    ap.add_argument(
+        "--unstable_reward_penalty",
+        type=float,
+        default=-25.0,
+        help="Fallback penalty reward for unstable or non-finite transitions.",
+    )
+    ap.add_argument(
+        "--unstable_gain_threshold",
+        type=float,
+        default=20.0,
+        help=(
+            "Mark transition unstable when realized-vs-command motion gain exceeds this value. "
+            "Use <=0 to disable this check."
+        ),
+    )
+    ap.add_argument(
+        "--unstable_realized_xyz_norm_threshold",
+        type=float,
+        default=0.25,
+        help=(
+            "Mark transition unstable when realized EE delta norm (meters) exceeds this value. "
+            "Use <=0 to disable this check."
+        ),
+    )
+    ap.add_argument(
+        "--unstable_env_reward_abs_threshold",
+        type=float,
+        default=180.0,
+        help=(
+            "Mark transition unstable when absolute raw env reward exceeds this value. "
+            "Use <=0 to disable this check."
+        ),
+    )
 
     # Runtime
     ap.add_argument("--seed", type=int, default=7)
@@ -1682,7 +1733,10 @@ def _distance_ee_to_target_from_obs(obs: Dict[str, Any]) -> Optional[float]:
     tgt_arr = np.asarray(tgt, dtype=np.float32).reshape(-1)
     if ee_arr.shape[0] < 3 or tgt_arr.shape[0] < 3:
         return None
-    return float(np.linalg.norm(ee_arr[:3] - tgt_arr[:3]))
+    dist = float(np.linalg.norm(ee_arr[:3] - tgt_arr[:3]))
+    if not math.isfinite(dist):
+        return None
+    return dist
 
 
 def _shape_reward_with_delta_progress(
@@ -1692,12 +1746,22 @@ def _shape_reward_with_delta_progress(
     delta_closer_reward_coef: float,
     delta_farther_penalty_coef: float,
 ) -> Tuple[float, float, float, float]:
+    env_reward_safe = float(env_reward)
+    if not math.isfinite(env_reward_safe):
+        env_reward_safe = 0.0
+
     if distance_before is None or distance_after is None:
-        return float(env_reward), 0.0, 0.0, 0.0
+        return env_reward_safe, 0.0, 0.0, 0.0
+
     raw_delta = float(distance_before - distance_after)
+    if not math.isfinite(raw_delta):
+        return env_reward_safe, 0.0, 0.0, 0.0
+
     closer_bonus = float(max(raw_delta, 0.0) * max(float(delta_closer_reward_coef), 0.0))
     farther_penalty = float(max(-raw_delta, 0.0) * max(float(delta_farther_penalty_coef), 0.0))
-    shaped_reward = float(env_reward + closer_bonus - farther_penalty)
+    shaped_reward = float(env_reward_safe + closer_bonus - farther_penalty)
+    if not math.isfinite(shaped_reward):
+        shaped_reward = env_reward_safe
     return shaped_reward, closer_bonus, farther_penalty, raw_delta
 
 
@@ -1768,6 +1832,65 @@ def _finite_float_or_none(value: Any) -> Optional[float]:
     if not math.isfinite(out):
         return None
     return out
+
+
+def _sanitize_env_reward(
+    reward_raw: Any,
+    clip_abs: float,
+    fallback_reward: float,
+) -> Tuple[float, Optional[float], bool, bool]:
+    raw_f = _finite_float_or_none(reward_raw)
+    non_finite = raw_f is None
+    reward = float(fallback_reward if raw_f is None else raw_f)
+
+    clipped = False
+    clip_abs_f = max(0.0, float(clip_abs))
+    if clip_abs_f > 0.0 and abs(reward) > clip_abs_f:
+        reward = float(np.clip(reward, -clip_abs_f, clip_abs_f))
+        clipped = True
+
+    return reward, raw_f, clipped, non_finite
+
+
+def _detect_unstable_transition(
+    *,
+    env_reward_raw: Optional[float],
+    motion_diag: Dict[str, Any],
+    unstable_gain_threshold: float,
+    unstable_realized_xyz_norm_threshold: float,
+    unstable_env_reward_abs_threshold: float,
+) -> Tuple[bool, str]:
+    reasons: List[str] = []
+
+    if env_reward_raw is None:
+        reasons.append("reward_non_finite")
+    elif unstable_env_reward_abs_threshold > 0.0 and abs(env_reward_raw) > float(unstable_env_reward_abs_threshold):
+        reasons.append("reward_spike")
+
+    realized = np.asarray(
+        motion_diag.get("realized_xyz_delta", np.full((3,), np.nan, dtype=np.float32)),
+        dtype=np.float32,
+    ).reshape(-1)
+    if realized.shape[0] >= 3:
+        realized_xyz = realized[:3]
+        if not np.all(np.isfinite(realized_xyz)):
+            reasons.append("realized_xyz_non_finite")
+        elif unstable_realized_xyz_norm_threshold > 0.0:
+            realized_norm = float(np.linalg.norm(realized_xyz))
+            if realized_norm > float(unstable_realized_xyz_norm_threshold):
+                reasons.append("realized_xyz_jump")
+
+    gain = _finite_float_or_none(motion_diag.get("realized_vs_command_gain"))
+    if (
+        gain is not None
+        and unstable_gain_threshold > 0.0
+        and gain > float(unstable_gain_threshold)
+    ):
+        reasons.append("gain_spike")
+
+    if not reasons:
+        return False, ""
+    return True, ";".join(reasons)
 
 
 def _first_reward_value(info: Dict[str, Any], candidates: Sequence[str]) -> float:
@@ -2011,6 +2134,12 @@ def run_validation_rollouts(
     action_step_xyz: float,
     delta_closer_reward_coef: float,
     delta_farther_penalty_coef: float,
+    reward_clip_abs: float,
+    guard_unstable_transitions: bool,
+    unstable_reward_penalty: float,
+    unstable_gain_threshold: float,
+    unstable_realized_xyz_norm_threshold: float,
+    unstable_env_reward_abs_threshold: float,
     save_frames: bool,
     quiet_env_logs: bool,
     next_reset_options,
@@ -2027,6 +2156,9 @@ def run_validation_rollouts(
     episode_r_success_mean: List[float] = []
     episode_motion_gain_mean: List[float] = []
     episode_motion_cosine_mean: List[float] = []
+    unstable_transition_count = 0
+    reward_clip_count = 0
+    reward_non_finite_count = 0
     action_xyz_samples: List[np.ndarray] = []
     action_samples: List[np.ndarray] = []
     target_objects_seen: set[str] = set()
@@ -2069,19 +2201,50 @@ def run_validation_rollouts(
             dist_before = _distance_ee_to_target_from_obs(obs)
             with _silence_stdio(bool(quiet_env_logs)):
                 next_obs, env_reward, done, info = val_env.step(action_np)
+            info = dict(info) if isinstance(info, dict) else {}
             motion_diag = _motion_diagnostics(
                 action_xyz=action_np[:3],
                 ee_before=obs.get("ee_position"),
                 ee_after=next_obs.get("ee_position"),
                 action_step_xyz=action_step_xyz,
             )
+            env_reward_safe, env_reward_raw, env_reward_clipped, env_reward_non_finite = _sanitize_env_reward(
+                reward_raw=env_reward,
+                clip_abs=reward_clip_abs,
+                fallback_reward=unstable_reward_penalty,
+            )
+            if env_reward_clipped:
+                reward_clip_count += 1
+            if env_reward_non_finite:
+                reward_non_finite_count += 1
+
+            unstable, unstable_reason = _detect_unstable_transition(
+                env_reward_raw=env_reward_raw,
+                motion_diag=motion_diag,
+                unstable_gain_threshold=unstable_gain_threshold,
+                unstable_realized_xyz_norm_threshold=unstable_realized_xyz_norm_threshold,
+                unstable_env_reward_abs_threshold=unstable_env_reward_abs_threshold,
+            )
+            forced_unstable_reset = bool(guard_unstable_transitions and unstable)
+            if forced_unstable_reset:
+                unstable_transition_count += 1
+                done = True
+                env_reward_safe = float(unstable_reward_penalty)
+
+            info["unstable_transition"] = bool(unstable)
+            info["unstable_reason"] = str(unstable_reason)
+            info["forced_unstable_reset"] = bool(forced_unstable_reset)
+            info["reward_env_raw"] = _float_or_none(env_reward_raw)
+            info["reward_env_clipped"] = bool(env_reward_clipped)
+            info["reward_env_non_finite"] = bool(env_reward_non_finite)
+
             dist_after = _distance_ee_to_target_from_obs(next_obs)
             target_object_catalog, target_object_body, target_object_name = _extract_target_object_fields(info)
             if target_object_name:
                 target_objects_seen.add(target_object_name)
 
             shaped_reward, closer_bonus, farther_penalty, raw_delta = _shape_reward_with_delta_progress(
-                env_reward=env_reward,
+                env_reward=env_reward_safe,
                 distance_before=dist_before,
                 distance_after=dist_after,
                 delta_closer_reward_coef=delta_closer_reward_coef,
@@ -2089,7 +2252,7 @@ def run_validation_rollouts(
             )
             reward_components = _extract_reward_components(info if isinstance(info, dict) else {})
 
-            env_return += float(env_reward)
+            env_return += float(env_reward_safe)
             shaped_return += float(shaped_reward)
             success = bool(info.get("success", success))
             ep_r_xyz_sum += float(reward_components["r_xyz"])
@@ -2113,7 +2276,10 @@ def run_validation_rollouts(
                     "action_delta_norm": float(np.linalg.norm(action_np)),
                     "value_pred": float(value.item()),
                     "std_mean": float(std_action.mean().item()),
-                    "reward_env": float(env_reward),
+                    "reward_env": float(env_reward_safe),
+                    "reward_env_raw": _float_or_none(env_reward_raw),
+                    "reward_env_clipped": bool(env_reward_clipped),
+                    "reward_env_non_finite": bool(env_reward_non_finite),
                     "reward_shaped": float(shaped_reward),
                     "r_xyz": float(reward_components["r_xyz"]),
                     "r_orient": float(reward_components["r_orient"]),
@@ -2129,6 +2295,9 @@ def run_validation_rollouts(
                     "distance_before": _float_or_none(dist_before),
                     "distance_after": _float_or_none(dist_after),
                     "success": bool(info.get("success", False)),
+                    "unstable_transition": bool(unstable),
+                    "unstable_reason": str(unstable_reason),
+                    "forced_unstable_reset": bool(forced_unstable_reset),
                     "done": bool(done),
                 }
             )
@@ -2241,6 +2410,11 @@ def run_validation_rollouts(
         "motion_diagnostics": {
             "realized_vs_command_gain_mean": float(np.mean(episode_motion_gain_mean)) if episode_motion_gain_mean else 0.0,
             "realized_vs_command_cosine_mean": float(np.mean(episode_motion_cosine_mean)) if episode_motion_cosine_mean else 0.0,
+        },
+        "stability": {
+            "unstable_transition_count": int(unstable_transition_count),
+            "reward_clip_count": int(reward_clip_count),
+            "reward_non_finite_count": int(reward_non_finite_count),
         },
         "target_objects_seen": sorted(target_objects_seen),
         "action_dim_stats": action_dim_stats,
@@ -2569,6 +2743,11 @@ def main() -> None:
                 f"hold_steps={args.hold_steps} "
                 f"delta_closer_reward_coef={args.delta_closer_reward_coef} "
                 f"delta_farther_penalty_coef={args.delta_farther_penalty_coef} "
+                f"reward_clip_abs={args.reward_clip_abs} "
+                f"guard_unstable_transitions={bool(args.guard_unstable_transitions)} "
+                f"unstable_gain_threshold={args.unstable_gain_threshold} "
+                f"unstable_realized_xyz_norm_threshold={args.unstable_realized_xyz_norm_threshold} "
+                f"unstable_env_reward_abs_threshold={args.unstable_env_reward_abs_threshold} "
                 f"validate_every_updates={args.validate_every_updates} "
                 f"rollout_tap_every_updates={args.rollout_tap_every_updates}",
                 flush=True,
@@ -2660,6 +2839,9 @@ def main() -> None:
             motion_cosine_values: List[float] = []
             episode_returns: List[float] = []
             episode_returns_env: List[float] = []
+            unstable_transition_count = 0
+            reward_clip_count = 0
+            reward_non_finite_count = 0
 
             rewards_buf = np.zeros((args.rollout_steps, n_envs_local), dtype=np.float32)
             env_rewards_buf = np.zeros((args.rollout_steps, n_envs_local), dtype=np.float32)
@@ -2706,13 +2888,44 @@ def main() -> None:
                     obs = obs_batch[env_idx]
                     action_env = env_actions[env_idx]
                     dist_before = _distance_ee_to_target_from_obs(obs)
-                    next_obs, env_reward, env_done, step_info = env.step(action_env)
+                    next_obs, env_reward_raw_value, env_done, step_info = env.step(action_env)
+                    step_info = dict(step_info) if isinstance(step_info, dict) else {}
                     motion_diag = _motion_diagnostics(
                         action_xyz=action_env[:3],
                         ee_before=obs.get("ee_position"),
                         ee_after=next_obs.get("ee_position"),
                         action_step_xyz=args.action_step_xyz,
                     )
+                    env_reward, env_reward_raw, env_reward_clipped, env_reward_non_finite = _sanitize_env_reward(
+                        reward_raw=env_reward_raw_value,
+                        clip_abs=args.reward_clip_abs,
+                        fallback_reward=args.unstable_reward_penalty,
+                    )
+                    if env_reward_clipped:
+                        reward_clip_count += 1
+                    if env_reward_non_finite:
+                        reward_non_finite_count += 1
+
+                    unstable, unstable_reason = _detect_unstable_transition(
+                        env_reward_raw=env_reward_raw,
+                        motion_diag=motion_diag,
+                        unstable_gain_threshold=args.unstable_gain_threshold,
+                        unstable_realized_xyz_norm_threshold=args.unstable_realized_xyz_norm_threshold,
+                        unstable_env_reward_abs_threshold=args.unstable_env_reward_abs_threshold,
+                    )
+                    forced_unstable_reset = bool(args.guard_unstable_transitions and unstable)
+                    if forced_unstable_reset:
+                        unstable_transition_count += 1
+                        env_done = True
+                        env_reward = float(args.unstable_reward_penalty)
+
+                    step_info["unstable_transition"] = bool(unstable)
+                    step_info["unstable_reason"] = str(unstable_reason)
+                    step_info["forced_unstable_reset"] = bool(forced_unstable_reset)
+                    step_info["reward_env_raw"] = _float_or_none(env_reward_raw)
+                    step_info["reward_env_clipped"] = bool(env_reward_clipped)
+                    step_info["reward_env_non_finite"] = bool(env_reward_non_finite)
+
                     dist_after = _distance_ee_to_target_from_obs(next_obs)
                     target_object_catalog, target_object_body, target_object_name = _extract_target_object_fields(step_info)
                     reward, closer_bonus, farther_penalty, raw_dist_delta = _shape_reward_with_delta_progress(
@@ -2730,7 +2943,7 @@ def main() -> None:
                         args.scene_refresh_every_steps > 0
                         and (steps_since_reset[env_idx] % args.scene_refresh_every_steps == 0)
                     )
-                    done = bool(env_done or forced_scene_refresh)
+                    done = bool(env_done or forced_scene_refresh or forced_unstable_reset)
 
                     rewards_buf[rollout_step, env_idx] = float(reward)
                     env_rewards_buf[rollout_step, env_idx] = float(env_reward)
@@ -2768,6 +2981,9 @@ def main() -> None:
                             "action_delta": action_env.astype(np.float32),
                             "action_delta_norm": float(np.linalg.norm(action_env)),
                             "reward_env": float(env_reward),
+                            "reward_env_raw": _float_or_none(env_reward_raw),
+                            "reward_env_clipped": bool(env_reward_clipped),
+                            "reward_env_non_finite": bool(env_reward_non_finite),
                             "reward_shaped": float(reward),
                             "r_xyz": float(reward_components["r_xyz"]),
                             "r_orient": float(reward_components["r_orient"]),
@@ -2800,6 +3016,9 @@ def main() -> None:
                             "target_object_name": target_object_name,
                             "env_done": bool(env_done),
                             "forced_scene_refresh": bool(forced_scene_refresh),
+                            "unstable_transition": bool(unstable),
+                            "unstable_reason": str(unstable_reason),
+                            "forced_unstable_reset": bool(forced_unstable_reset),
                         }
                     )
 
@@ -2828,7 +3047,13 @@ def main() -> None:
                                 "success": bool(step_info.get("success", False)),
                                 "env_done": bool(env_done),
                                 "forced_scene_refresh": bool(forced_scene_refresh),
+                                "forced_unstable_reset": bool(forced_unstable_reset),
+                                "unstable_transition": bool(unstable),
+                                "unstable_reason": str(unstable_reason),
                                 "reward_env": float(env_reward),
+                                "reward_env_raw": _float_or_none(env_reward_raw),
+                                "reward_env_clipped": bool(env_reward_clipped),
+                                "reward_env_non_finite": bool(env_reward_non_finite),
                                 "reward_shaped": float(reward),
                                 "r_xyz": float(reward_components["r_xyz"]),
                                 "r_orient": float(reward_components["r_orient"]),
@@ -3032,6 +3257,9 @@ def main() -> None:
             avg_r_success = float(np.mean(reward_success_values)) if reward_success_values else 0.0
             avg_motion_gain = float(np.mean(motion_gain_values)) if motion_gain_values else 0.0
             avg_motion_cosine = float(np.mean(motion_cosine_values)) if motion_cosine_values else 0.0
+            unstable_transition_rate = float(unstable_transition_count / max(1, len(transitions)))
+            reward_clip_rate = float(reward_clip_count / max(1, len(transitions)))
+            reward_non_finite_rate = float(reward_non_finite_count / max(1, len(transitions)))
 
             if updates_pbar is not None:
                 updates_pbar.update(1)
@@ -3044,6 +3272,7 @@ def main() -> None:
                     l_pi=f"{avg_policy_loss:.3f}",
                     l_v=f"{avg_value_loss:.3f}",
                     kl=f"{avg_approx_kl:.4f}",
+                    unstable=f"{unstable_transition_rate:.3f}",
                     log_std=f"{float(policy_core.log_std.mean().item()):.3f}",
                 )
             elif is_main:
@@ -3066,6 +3295,9 @@ def main() -> None:
                     f"r_success_mean={avg_r_success:.4f} "
                     f"motion_gain_mean={avg_motion_gain:.4f} "
                     f"motion_cosine_mean={avg_motion_cosine:.4f} "
+                    f"unstable_transition_rate={unstable_transition_rate:.4f} "
+                    f"reward_clip_rate={reward_clip_rate:.4f} "
+                    f"reward_non_finite_rate={reward_non_finite_rate:.4f} "
                     f"log_std_mean={float(policy_core.log_std.mean().item()):.4f}",
                     flush=True,
                 )
@@ -3091,6 +3323,9 @@ def main() -> None:
                 tb_writer.add_scalar("train/reward_component_r_success_mean", avg_r_success, global_step)
                 tb_writer.add_scalar("train/motion_realized_vs_command_gain_mean", avg_motion_gain, global_step)
                 tb_writer.add_scalar("train/motion_realized_vs_command_cosine_mean", avg_motion_cosine, global_step)
+                tb_writer.add_scalar("train/unstable_transition_rate", unstable_transition_rate, global_step)
+                tb_writer.add_scalar("train/reward_clip_rate", reward_clip_rate, global_step)
+                tb_writer.add_scalar("train/reward_non_finite_rate", reward_non_finite_rate, global_step)
                 tb_writer.add_scalar("train/log_std_mean", float(policy_core.log_std.mean().item()), global_step)
                 tb_writer.add_scalar("train/update_index", float(update), global_step)
                 tb_writer.flush()
@@ -3128,6 +3363,12 @@ def main() -> None:
                     action_step_xyz=args.action_step_xyz,
                     delta_closer_reward_coef=args.delta_closer_reward_coef,
                     delta_farther_penalty_coef=args.delta_farther_penalty_coef,
+                    reward_clip_abs=args.reward_clip_abs,
+                    guard_unstable_transitions=bool(args.guard_unstable_transitions),
+                    unstable_reward_penalty=args.unstable_reward_penalty,
+                    unstable_gain_threshold=args.unstable_gain_threshold,
+                    unstable_realized_xyz_norm_threshold=args.unstable_realized_xyz_norm_threshold,
+                    unstable_env_reward_abs_threshold=args.unstable_env_reward_abs_threshold,
                     save_frames=bool(args.save_validation_frames),
                     quiet_env_logs=bool(args.quiet_env_logs),
                     next_reset_options=next_val_reset_options,
@@ -3156,6 +3397,15 @@ def main() -> None:
                         f"[validation u{update:05d}] motion "
                         f"gain={float(motion_diag_val.get('realized_vs_command_gain_mean', 0.0)):.4f} "
                         f"cosine={float(motion_diag_val.get('realized_vs_command_cosine_mean', 0.0)):.4f}",
+                        flush=True,
+                    )
+                stability_val = val_summary.get("stability", {})
+                if stability_val:
+                    print(
+                        f"[validation u{update:05d}] stability "
+                        f"unstable={int(stability_val.get('unstable_transition_count', 0))} "
+                        f"reward_clip={int(stability_val.get('reward_clip_count', 0))} "
+                        f"reward_non_finite={int(stability_val.get('reward_non_finite_count', 0))}",
                         flush=True,
                     )
                 xyz_stats = val_summary.get("action_xyz_stats", {})
