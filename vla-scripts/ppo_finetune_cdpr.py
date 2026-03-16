@@ -63,6 +63,9 @@ except Exception:
     tqdm = None
 
 
+POLICY_ACTION_DIM = ACTION_DIM * NUM_ACTIONS_CHUNK
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         prog="PPO finetune OpenVLA-OFT on CDPR",
@@ -1153,7 +1156,7 @@ class OpenVLAPPOPolicy(nn.Module):
         self.num_images_in_input = int(num_images_in_input)
         self.log_std = nn.Parameter(
             torch.full(
-                (ACTION_DIM,),
+                (POLICY_ACTION_DIM,),
                 float(init_log_std),
                 dtype=torch.float32,
                 device=self.device,
@@ -1298,7 +1301,7 @@ class OpenVLAPPOPolicy(nn.Module):
 
         pred_pre = self.action_head.predict_action(action_hidden_states)
         action_chunk = torch.tanh(pred_pre)
-        mean_action = action_chunk[:, 0, :].to(dtype=torch.float32)
+        mean_action = action_chunk.reshape(action_chunk.shape[0], POLICY_ACTION_DIM).to(dtype=torch.float32)
 
         std = (
             torch.exp(self.log_std)
@@ -1434,6 +1437,87 @@ class CDPRVisionLanguageEnv:
                 sim.run_simulation_step(capture_frame=capture)
             except Exception:
                 break
+
+    @staticmethod
+    def _reshape_action_chunk(action: np.ndarray) -> np.ndarray:
+        action_arr = np.asarray(action, dtype=np.float32)
+        if action_arr.ndim == 1:
+            if action_arr.size == ACTION_DIM:
+                return action_arr.reshape(1, ACTION_DIM)
+            if action_arr.size == POLICY_ACTION_DIM:
+                return action_arr.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+        if action_arr.ndim == 2 and action_arr.shape[1] == ACTION_DIM:
+            return action_arr.astype(np.float32, copy=False)
+        raise ValueError(
+            f"Expected action with shape ({ACTION_DIM},), ({POLICY_ACTION_DIM},), or (T, {ACTION_DIM}); "
+            f"got {action_arr.shape}"
+        )
+
+    @staticmethod
+    def _accumulate_chunk_info(
+        aggregate: Optional[Dict[str, Any]],
+        step_info: Dict[str, Any],
+        step_reward: float,
+    ) -> Dict[str, Any]:
+        sum_keys = {
+            "reward",
+            "approach_reward",
+            "xyz_progress_reward",
+            "orientation_reward",
+            "motion_dir_reward",
+            "obj_motion_reward",
+            "lift_step_reward",
+            "success_bonus",
+            "z_height_penalty",
+            "idle_action_penalty",
+            "action_saturation_penalty",
+            "premature_close_penalty",
+            "distance_delta",
+            "distance_improve",
+            "distance_worsen",
+        }
+        bool_or_keys = {
+            "success",
+            "target_grasped",
+            "grasped",
+            "newly_grasped",
+            "caught_object_is_target",
+            "gripper_closed",
+        }
+
+        if aggregate is None:
+            aggregate = dict(step_info)
+            for key in sum_keys:
+                if key == "reward":
+                    aggregate[key] = float(step_reward)
+                elif key in step_info:
+                    val = _finite_float_or_none(step_info.get(key))
+                    if val is not None:
+                        aggregate[key] = float(val)
+            return aggregate
+
+        for key in sum_keys:
+            if key == "reward":
+                aggregate[key] = float(_finite_float_or_none(aggregate.get(key)) or 0.0) + float(step_reward)
+                continue
+            val = _finite_float_or_none(step_info.get(key))
+            if val is None:
+                continue
+            aggregate[key] = float(_finite_float_or_none(aggregate.get(key)) or 0.0) + float(val)
+
+        for key in bool_or_keys:
+            if key in step_info:
+                aggregate[key] = bool(aggregate.get(key, False)) or bool(step_info.get(key, False))
+
+        for key, value in step_info.items():
+            if key in sum_keys or key in bool_or_keys:
+                continue
+            if key in {"caught_object_body", "caught_object_catalog", "last_caught_object_body", "last_caught_object_catalog"}:
+                if str(value):
+                    aggregate[key] = value
+                continue
+            aggregate[key] = value
+        return aggregate
 
     @staticmethod
     def _sanitize_instruction_text(instruction: str, info: Optional[Dict[str, Any]] = None) -> str:
@@ -1625,14 +1709,35 @@ class CDPRVisionLanguageEnv:
         return self._activate_scene_wrapper_cache(scene_wrapper_cache, texture_name_by_wrapper)
 
     def step(self, action: np.ndarray):
-        action_env = np.asarray(action, dtype=np.float32).copy()
-        if self.invert_x_action:
-            action_env[0] *= -1.0
-        if self.invert_y_action:
-            action_env[1] *= -1.0
-        raw_obs, reward, terminated, truncated, info = self.env.step(action_env)
-        # Increase effective control dt by running extra sim substeps after each action.
-        self._advance_sim_substeps(capture_last_frame=True)
+        action_chunk = self._reshape_action_chunk(action)
+        total_reward = 0.0
+        done = False
+        raw_obs = None
+        info: Dict[str, Any] = {}
+        executed_steps = 0
+
+        for sub_idx, action_step in enumerate(action_chunk):
+            action_env = np.asarray(action_step, dtype=np.float32).copy()
+            if self.invert_x_action:
+                action_env[0] *= -1.0
+            if self.invert_y_action:
+                action_env[1] *= -1.0
+
+            raw_obs, reward_step, terminated, truncated, step_info = self.env.step(action_env)
+            total_reward += float(reward_step)
+            info = self._accumulate_chunk_info(
+                info if info else None,
+                dict(step_info) if isinstance(step_info, dict) else {},
+                float(reward_step),
+            )
+            executed_steps += 1
+            # Increase effective control dt by running extra sim substeps after each low-level action.
+            capture_last = bool(sub_idx == (len(action_chunk) - 1) or terminated or truncated)
+            self._advance_sim_substeps(capture_last_frame=capture_last)
+            done = bool(terminated or truncated)
+            if done:
+                break
+
         self._instruction = self._sanitize_instruction_text(
             str(info.get("language_instruction", self._instruction)),
             info if isinstance(info, dict) else None,
@@ -1640,6 +1745,9 @@ class CDPRVisionLanguageEnv:
         if isinstance(info, dict):
             info = dict(info)
             info["language_instruction"] = self._instruction
+            info["chunk_length_requested"] = int(action_chunk.shape[0])
+            info["chunk_length_executed"] = int(executed_steps)
+            info["reward_env_chunk_sum"] = float(total_reward)
 
         obs = {
             "image_primary": _latest_image_from_sim(self.env.sim, wrist=False),
@@ -1647,8 +1755,7 @@ class CDPRVisionLanguageEnv:
             "instruction": self._instruction,
         }
         self._attach_state(obs, raw_obs)
-        done = bool(terminated or truncated)
-        return obs, float(reward), done, info
+        return obs, float(total_reward), done, info
 
     def close(self):
         self.env.close()
@@ -1721,6 +1828,26 @@ def gaussian_log_prob(action: torch.Tensor, mean: torch.Tensor, std: torch.Tenso
 
 def gaussian_entropy(std: torch.Tensor) -> torch.Tensor:
     return 0.5 + 0.5 * math.log(2.0 * math.pi) + torch.log(std)
+
+
+def _reshape_action_chunk(action: Any) -> np.ndarray:
+    action_arr = np.asarray(action, dtype=np.float32)
+    if action_arr.ndim == 1:
+        if action_arr.size == ACTION_DIM:
+            return action_arr.reshape(1, ACTION_DIM)
+        if action_arr.size == POLICY_ACTION_DIM:
+            return action_arr.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
+    if action_arr.ndim == 2 and action_arr.shape[1] == ACTION_DIM:
+        return action_arr.astype(np.float32, copy=False)
+    raise ValueError(
+        f"Expected action with shape ({ACTION_DIM},), ({POLICY_ACTION_DIM},), or (T, {ACTION_DIM}); got {action_arr.shape}"
+    )
+
+
+def _chunk_command_xyz(action: Any, action_step_xyz: float) -> np.ndarray:
+    chunk = _reshape_action_chunk(action)
+    commanded = chunk[:, :3].sum(axis=0) * float(action_step_xyz)
+    return np.asarray(commanded, dtype=np.float32).reshape(3)
 
 
 def _distance_ee_to_target_from_obs(obs: Dict[str, Any]) -> Optional[float]:
@@ -1978,10 +2105,7 @@ def _motion_diagnostics(
     ee_after: Any,
     action_step_xyz: float,
 ) -> Dict[str, Any]:
-    action_xyz_arr = np.asarray(action_xyz, dtype=np.float32).reshape(-1)
-    if action_xyz_arr.shape[0] < 3:
-        action_xyz_arr = np.pad(action_xyz_arr, (0, max(0, 3 - action_xyz_arr.shape[0])))
-    commanded = action_xyz_arr[:3] * float(action_step_xyz)
+    commanded = _chunk_command_xyz(action_xyz, action_step_xyz)
 
     ee_before_arr = np.asarray(ee_before, dtype=np.float32).reshape(-1) if ee_before is not None else np.asarray([], dtype=np.float32)
     ee_after_arr = np.asarray(ee_after, dtype=np.float32).reshape(-1) if ee_after is not None else np.asarray([], dtype=np.float32)
@@ -2195,7 +2319,7 @@ def run_validation_rollouts(
                     instructions=[obs["instruction"]],
                 )
             action_np = torch.clamp(mean_action, -1.0, 1.0)[0].cpu().numpy().astype(np.float32)
-            action_xyz_samples.append(np.asarray(action_np[:3], dtype=np.float32))
+            action_xyz_samples.append(_chunk_command_xyz(action_np, action_step_xyz))
             action_samples.append(np.asarray(action_np, dtype=np.float32))
 
             dist_before = _distance_ee_to_target_from_obs(obs)
@@ -2203,7 +2327,7 @@ def run_validation_rollouts(
                 next_obs, env_reward, done, info = val_env.step(action_np)
             info = dict(info) if isinstance(info, dict) else {}
             motion_diag = _motion_diagnostics(
-                action_xyz=action_np[:3],
+                action_xyz=action_np,
                 ee_before=obs.get("ee_position"),
                 ee_after=next_obs.get("ee_position"),
                 action_step_xyz=action_step_xyz,
@@ -2349,7 +2473,7 @@ def run_validation_rollouts(
     action_all = (
         np.stack(action_samples, axis=0).astype(np.float32)
         if action_samples
-        else np.zeros((0, ACTION_DIM), dtype=np.float32)
+        else np.zeros((0, POLICY_ACTION_DIM), dtype=np.float32)
     )
     hist_edges = np.linspace(-1.0, 1.0, num=21, dtype=np.float32)
     axis_names = ("x", "y", "z")
@@ -2847,7 +2971,7 @@ def main() -> None:
             env_rewards_buf = np.zeros((args.rollout_steps, n_envs_local), dtype=np.float32)
             dones_buf = np.zeros((args.rollout_steps, n_envs_local), dtype=np.float32)
             values_buf = np.zeros((args.rollout_steps, n_envs_local), dtype=np.float32)
-            actions_buf = np.zeros((args.rollout_steps, n_envs_local, ACTION_DIM), dtype=np.float32)
+            actions_buf = np.zeros((args.rollout_steps, n_envs_local, POLICY_ACTION_DIM), dtype=np.float32)
             old_logprobs_buf = np.zeros((args.rollout_steps, n_envs_local), dtype=np.float32)
 
             rollout_pbar = (
@@ -2891,7 +3015,7 @@ def main() -> None:
                     next_obs, env_reward_raw_value, env_done, step_info = env.step(action_env)
                     step_info = dict(step_info) if isinstance(step_info, dict) else {}
                     motion_diag = _motion_diagnostics(
-                        action_xyz=action_env[:3],
+                        action_xyz=action_env,
                         ee_before=obs.get("ee_position"),
                         ee_after=next_obs.get("ee_position"),
                         action_step_xyz=args.action_step_xyz,
@@ -3112,7 +3236,7 @@ def main() -> None:
             rewards = rewards_buf.reshape(-1)
             env_rewards = env_rewards_buf.reshape(-1)
             values = values_buf.reshape(-1)
-            actions = actions_buf.reshape(-1, ACTION_DIM)
+            actions = actions_buf.reshape(-1, POLICY_ACTION_DIM)
             old_logprobs = old_logprobs_buf.reshape(-1)
             advantages = advantages.reshape(-1)
             returns = returns.reshape(-1)
@@ -3196,7 +3320,7 @@ def main() -> None:
                                 )
                             value_loss = 0.5 * ((value_pred_target - mb_ret) ** 2).mean()
 
-                            entropy = gaussian_entropy(std_action).sum(dim=-1).mean()
+                            entropy = gaussian_entropy(std_action).sum(dim=-1).mean() / float(NUM_ACTIONS_CHUNK)
                             entropy_loss = -entropy
                             loss = policy_loss + args.ent_coef * entropy_loss + args.vf_coef * value_loss
 
