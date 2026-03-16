@@ -154,8 +154,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=6,
         help=(
-            "How many simulator substeps to run after each env action. "
-            "Intermediate substeps skip frame capture; final substep captures frame for next observation."
+            "How many extra simulator ticks to hold each low-level action after its first tick. "
+            "Effective action duration is (1 + hold_steps) simulation steps."
         ),
     )
     ap.add_argument("--capture_frames", action=argparse.BooleanOptionalAction, default=True)
@@ -1392,6 +1392,7 @@ class CDPRVisionLanguageEnv:
             max_steps=max_steps,
             action_step_xyz=action_step_xyz,
             action_step_yaw=action_step_yaw,
+            hold_steps=hold_steps,
             capture_frames=capture_frames,
             instruction_types=instruction_types,
             desk_textures_dir=desk_textures_dir,
@@ -1405,7 +1406,7 @@ class CDPRVisionLanguageEnv:
         self._instruction = ""
         self.invert_x_action = bool(invert_x_action)
         self.invert_y_action = bool(invert_y_action)
-        self.hold_steps = max(1, int(hold_steps))
+        self.hold_steps = max(0, int(hold_steps))
         self._scene_wrapper_cache: Dict[str, List[Path]] = {}
         self._texture_name_by_wrapper: Dict[str, str] = {}
 
@@ -1731,9 +1732,6 @@ class CDPRVisionLanguageEnv:
                 float(reward_step),
             )
             executed_steps += 1
-            # Increase effective control dt by running extra sim substeps after each low-level action.
-            capture_last = bool(sub_idx == (len(action_chunk) - 1) or terminated or truncated)
-            self._advance_sim_substeps(capture_last_frame=capture_last)
             done = bool(terminated or truncated)
             if done:
                 break
@@ -2602,9 +2600,9 @@ def main() -> None:
         raise ValueError("--validation_episodes must be >= 1.")
     if args.validation_max_steps < 1:
         raise ValueError("--validation_max_steps must be >= 1.")
-    if args.hold_steps < 1:
-        print("[WARN] --hold_steps must be >= 1; clamping to 1.", flush=True)
-        args.hold_steps = 1
+    if args.hold_steps < 0:
+        print("[WARN] --hold_steps must be >= 0; clamping to 0.", flush=True)
+        args.hold_steps = 0
     if args.scene_refresh_every_steps == 0:
         args.scene_refresh_every_steps = -1
     if args.validate_every_updates == 0:
