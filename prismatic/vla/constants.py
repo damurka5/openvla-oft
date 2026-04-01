@@ -115,6 +115,37 @@ def detect_robot_platform():
         return "LIBERO"
     return "LIBERO"  # default
 
+def _read_positive_int_env(name):
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        print(f"[WARN] Ignoring invalid {name}={raw!r}; expected a positive integer.")
+        return None
+    if value <= 0:
+        print(f"[WARN] Ignoring invalid {name}={raw!r}; expected a positive integer.")
+        return None
+    return value
+
+
+def _apply_dimension_overrides(base_constants):
+    out = dict(base_constants)
+    overrides = {
+        "NUM_ACTIONS_CHUNK": _read_positive_int_env("VLA_NUM_ACTIONS_CHUNK"),
+        "ACTION_DIM": _read_positive_int_env("VLA_ACTION_DIM"),
+        "PROPRIO_DIM": _read_positive_int_env("VLA_PROPRIO_DIM"),
+    }
+    if overrides["ACTION_DIM"] is not None and overrides["PROPRIO_DIM"] is None:
+        overrides["PROPRIO_DIM"] = overrides["ACTION_DIM"]
+    for key, value in overrides.items():
+        if value is not None:
+            out[key] = value
+    active = {key: value for key, value in overrides.items() if value is not None}
+    return out, active
+
+
 ROBOT_PLATFORM = detect_robot_platform()
 
 if ROBOT_PLATFORM == "CDPR":
@@ -126,6 +157,8 @@ elif ROBOT_PLATFORM == "BRIDGE":
 else:
     constants = LIBERO_CONSTANTS
 
+constants, active_overrides = _apply_dimension_overrides(constants)
+
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]
 ACTION_DIM = constants["ACTION_DIM"]
 PROPRIO_DIM = constants["PROPRIO_DIM"]
@@ -136,4 +169,6 @@ print(f"  NUM_ACTIONS_CHUNK = {NUM_ACTIONS_CHUNK}")
 print(f"  ACTION_DIM = {ACTION_DIM}")
 print(f"  PROPRIO_DIM = {PROPRIO_DIM}")
 print(f"  ACTION_PROPRIO_NORMALIZATION_TYPE = {ACTION_PROPRIO_NORMALIZATION_TYPE}")
+if active_overrides:
+    print(f"  env overrides = {active_overrides}")
 print("If needed, manually set the correct constants in `prismatic/vla/constants.py`!")

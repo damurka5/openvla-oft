@@ -1290,7 +1290,7 @@ class OpenVLAPPOPolicy(nn.Module):
         images_primary: List[np.ndarray],
         instructions: List[str],
         images_wrist: Optional[List[np.ndarray]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         input_ids, attention_mask, pixel_values = self._prepare_inputs(images_primary, images_wrist, instructions)
 
         action_hidden_states = self._extract_action_hidden_states(
@@ -1300,6 +1300,7 @@ class OpenVLAPPOPolicy(nn.Module):
         )
 
         pred_pre = self.action_head.predict_action(action_hidden_states)
+        mean_pre_action = pred_pre.reshape(pred_pre.shape[0], POLICY_ACTION_DIM).to(dtype=torch.float32)
         action_chunk = torch.tanh(pred_pre)
         mean_action = action_chunk.reshape(action_chunk.shape[0], POLICY_ACTION_DIM).to(dtype=torch.float32)
 
@@ -1313,7 +1314,7 @@ class OpenVLAPPOPolicy(nn.Module):
 
         current_action_hidden = action_hidden_states[:, :ACTION_DIM, :]
         value = self.value_head(current_action_hidden)
-        return mean_action, std, value
+        return mean_action, std, value, mean_pre_action
 
 
 @dataclass
@@ -1828,6 +1829,31 @@ def gaussian_entropy(std: torch.Tensor) -> torch.Tensor:
     return 0.5 + 0.5 * math.log(2.0 * math.pi) + torch.log(std)
 
 
+def _atanh_clamped(action: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    clipped = torch.clamp(action, -1.0 + float(eps), 1.0 - float(eps))
+    return 0.5 * (torch.log1p(clipped) - torch.log1p(-clipped))
+
+
+def squashed_gaussian_sample(mean: torch.Tensor, std: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    pre_tanh = gaussian_sample(mean, std)
+    action = torch.tanh(pre_tanh)
+    return action, pre_tanh
+
+
+def squashed_gaussian_log_prob(
+    action: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    *,
+    pre_tanh_action: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    latent = pre_tanh_action if pre_tanh_action is not None else _atanh_clamped(action, eps=eps)
+    base_log_prob = gaussian_log_prob(latent, mean, std)
+    squash_correction = torch.log(1.0 - torch.tanh(latent).pow(2) + float(eps))
+    return base_log_prob - squash_correction
+
+
 def _reshape_action_chunk(action: Any) -> np.ndarray:
     action_arr = np.asarray(action, dtype=np.float32)
     if action_arr.ndim == 1:
@@ -2311,7 +2337,7 @@ def run_validation_rollouts(
                     Image.fromarray(_to_uint8_rgb(wrist)).save(ep_dir / f"wrist_{step_idx:03d}.png")
 
             with torch.no_grad():
-                mean_action, std_action, value = policy_core(
+                mean_action, std_action, value, _ = policy_core(
                     images_primary=[obs["image_primary"]],
                     images_wrist=[obs["image_wrist"]] if num_images_in_input > 1 else None,
                     instructions=[obs["instruction"]],
@@ -2992,13 +3018,18 @@ def main() -> None:
                 batch_instructions = [obs_batch[i]["instruction"] for i in range(n_envs_local)]
 
                 with torch.no_grad():
-                    mean_action, std_action, value = policy(
+                    mean_action, std_action, value, mean_pre_action = policy(
                         images_primary=batch_images_primary,
                         images_wrist=batch_images_wrist,
                         instructions=batch_instructions,
                     )
-                    sampled_action_t = gaussian_sample(mean_action, std_action)
-                    logprob_t = gaussian_log_prob(sampled_action_t, mean_action, std_action).sum(dim=-1)
+                    sampled_action_t, sampled_pre_tanh_t = squashed_gaussian_sample(mean_pre_action, std_action)
+                    logprob_t = squashed_gaussian_log_prob(
+                        sampled_action_t,
+                        mean_pre_action,
+                        std_action,
+                        pre_tanh_action=sampled_pre_tanh_t,
+                    ).sum(dim=-1)
                     action_env_t = torch.clamp(sampled_action_t, -1.0, 1.0)
 
                 sampled_actions = sampled_action_t.cpu().numpy().astype(np.float32)
@@ -3215,7 +3246,7 @@ def main() -> None:
                     else None
                 )
                 next_instructions = [obs_batch[i]["instruction"] for i in range(n_envs_local)]
-                _, _, next_value_t = policy(
+                _, _, next_value_t, _ = policy(
                     images_primary=next_images_primary,
                     images_wrist=next_images_wrist,
                     instructions=next_instructions,
@@ -3288,7 +3319,7 @@ def main() -> None:
                             )
                             mb_instr = [transitions[i].instruction for i in micro_idx]
 
-                            mean_action, std_action, value_pred = policy(
+                            mean_action, std_action, value_pred, mean_pre_action = policy(
                                 images_primary=mb_imgs_primary,
                                 images_wrist=mb_imgs_wrist,
                                 instructions=mb_instr,
@@ -3300,7 +3331,11 @@ def main() -> None:
                             mb_ret = torch.tensor(returns[micro_idx], dtype=torch.float32, device=device)
                             mb_old_values = torch.tensor(values[micro_idx], dtype=torch.float32, device=device)
 
-                            new_logprob = gaussian_log_prob(mb_actions, mean_action, std_action).sum(dim=-1)
+                            new_logprob = squashed_gaussian_log_prob(
+                                mb_actions,
+                                mean_pre_action,
+                                std_action,
+                            ).sum(dim=-1)
                             log_ratio = new_logprob - mb_old_logprobs
                             ratio = torch.exp(log_ratio)
 
