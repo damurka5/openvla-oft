@@ -18,9 +18,11 @@ SCRIPT_PATH="${SCRIPT_PATH:-$RLVLA_REPO_ROOT/rl_vla_bootstrapping/policy/grpo_fi
 EXTERNAL_GRPO_SCRIPT="${EXTERNAL_GRPO_SCRIPT:-$OPENVLA_REPO_ROOT/vla-scripts/grpo_finetune_cdpr.py}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
-NUM_PARALLEL_ENVS="${NUM_PARALLEL_ENVS:-12}"
-MINIBATCH_SIZE="${MINIBATCH_SIZE:-32}"
-MICROBATCH_SIZE="${MICROBATCH_SIZE:-16}"
+# The GRPO trainer forces microbatch_size == minibatch_size under DDP,
+# so these defaults stay intentionally conservative on multi-GPU runs.
+NUM_PARALLEL_ENVS="${NUM_PARALLEL_ENVS:-8}"
+MINIBATCH_SIZE="${MINIBATCH_SIZE:-8}"
+MICROBATCH_SIZE="${MICROBATCH_SIZE:-8}"
 GRPO_GROUP_SIZE="${GRPO_GROUP_SIZE:-2}"
 GRPO_GROUP_SELECTION="${GRPO_GROUP_SELECTION:-uniform}"
 
